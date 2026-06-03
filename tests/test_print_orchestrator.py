@@ -1,16 +1,24 @@
+import uuid
+
 import pytest
 
 from app.domain.print_orchestration_schemas import (
+    SubsystemExecutionStatus,
     WorkflowAdvanceRequest,
     WorkflowAdvanceResult,
     WorkflowOperation,
 )
 from app.domain.print_schemas import (
+    AssetRole,
     PrintWorkflowRunResult,
     PrintWorkflowState,
+    ProductType,
+    RawSubmission,
     ResultStatus,
+    SubmittedAsset,
 )
 from app.domain.print_state_machine import get_allowed_transitions
+from app.services import print_orchestrator
 from app.services.print_orchestrator import advance_workflow
 
 S = PrintWorkflowState
@@ -159,3 +167,100 @@ def test_allowed_transitions_included_on_illegal_check():
 
     expected = get_allowed_transitions(S.SUBMITTED)
     assert set(result.transition_check.allowed_transitions) == expected
+
+
+# ---------------------------------------------------------------------------
+# Normalization wiring (Phase 1) — expected to fail until the spine calls the
+# normalization service from NORMALIZATION_PENDING.
+# ---------------------------------------------------------------------------
+
+
+def _asset(role=AssetRole.PRIMARY):
+    return SubmittedAsset(
+        asset_id=str(uuid.uuid4()),
+        role=role,
+        uri="file:///tmp/asset.png",
+    )
+
+
+def _raw_submission(
+    requested_product="banner",
+    brief="A bold outdoor banner advertising a summer sale.",
+    assets=None,
+):
+    if assets is None:
+        assets = [_asset(AssetRole.PRIMARY)]
+    return RawSubmission(
+        submission_id=str(uuid.uuid4()),
+        requester="designer@example.com",
+        requested_product=requested_product,
+        brief=brief,
+        assets=assets,
+    )
+
+
+def test_normalization_wiring_valid_submission_advances():
+    submission = _raw_submission(requested_product="banner")
+    request = _request(
+        S.NORMALIZATION_PENDING,
+        target=None,
+        raw_submission=submission,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.NORMALIZED
+    assert result.run_result.normalization is not None
+    assert result.run_result.normalization.status == ResultStatus.PASSED
+    assert result.run_result.normalization.design_job is not None
+    assert (
+        result.run_result.normalization.design_job.product_type == ProductType.BANNER
+    )
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "NormalizationService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+
+def test_normalization_wiring_needs_review_stops():
+    submission = _raw_submission(brief=None)
+    request = _request(
+        S.NORMALIZATION_PENDING,
+        target=None,
+        raw_submission=submission,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.NORMALIZATION_NEEDS_REVIEW
+    assert result.stopped is True
+    assert result.status == ResultStatus.NEEDS_REVIEW
+    assert result.run_result.normalization is not None
+    assert result.run_result.normalization.status == ResultStatus.NEEDS_REVIEW
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+
+def test_normalization_wiring_failure_path(monkeypatch):
+    def _boom(_raw_submission):
+        raise RuntimeError("normalization exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator, "normalize_submission", _boom, raising=False
+    )
+
+    submission = _raw_submission(requested_product="banner")
+    request = _request(
+        S.NORMALIZATION_PENDING,
+        target=None,
+        raw_submission=submission,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.NORMALIZATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.specification is None

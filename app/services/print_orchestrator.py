@@ -14,15 +14,19 @@ Phase 0 deliberately contains NO subsystem logic:
 Everything here is a pure function of its inputs, so it is easy to test.
 """
 
-from typing import Optional
+from datetime import datetime
+from typing import List, Optional
 
 from app.domain.print_orchestration_schemas import (
+    SubsystemExecutionRecord,
+    SubsystemExecutionStatus,
     TransitionCheckResult,
     TransitionDecision,
     WorkflowAdvanceRequest,
     WorkflowAdvanceResult,
 )
 from app.domain.print_schemas import (
+    NormalizationResult,
     PrintWorkflowRunResult,
     PrintWorkflowStage,
     PrintWorkflowState,
@@ -35,6 +39,7 @@ from app.domain.print_state_machine import (
     is_human_review_state,
     is_terminal_state,
 )
+from app.services.print_normalization import normalize_submission
 
 S = PrintWorkflowState
 
@@ -133,8 +138,13 @@ def _result(
     stop_reason: Optional[str] = None,
     next_steps: Optional[str] = None,
     reasons: Optional[list] = None,
+    subsystem_records: Optional[List[SubsystemExecutionRecord]] = None,
+    normalization: Optional[NormalizationResult] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
+    run_result = _build_partial_run_result(request, current_state)
+    if normalization is not None:
+        run_result.normalization = normalization
     return WorkflowAdvanceResult(
         run_id=request.run_id,
         idempotency_key=request.idempotency_key,
@@ -142,13 +152,133 @@ def _result(
         previous_state=previous_state,
         current_state=current_state,
         transition_check=transition_check,
-        run_result=_build_partial_run_result(request, current_state),
-        subsystem_records=[],  # Phase 0: the spine calls no subsystems.
+        run_result=run_result,
+        subsystem_records=subsystem_records or [],
         stopped=stopped,
         stop_reason=stop_reason,
         status=status,
         reasons=reasons or [],
         next_steps=next_steps,
+    )
+
+
+def _check(
+    from_state: PrintWorkflowState,
+    to_state: PrintWorkflowState,
+) -> TransitionCheckResult:
+    """Record (do not enforce) the legality of a from->to transition."""
+    allowed = can_transition(from_state, to_state)
+    return TransitionCheckResult(
+        from_state=from_state,
+        to_state=to_state,
+        allowed=allowed,
+        decision=TransitionDecision.ALLOWED if allowed else TransitionDecision.REJECTED,
+        reason=(
+            f"Transition {from_state.value} -> {to_state.value} is legal"
+            if allowed
+            else f"Transition {from_state.value} -> {to_state.value} is not a legal transition"
+        ),
+        allowed_transitions=sorted(
+            get_allowed_transitions(from_state), key=lambda s: s.value
+        ),
+    )
+
+
+def _latency_ms(start: datetime, end: datetime) -> int:
+    """Whole-millisecond latency between two timestamps (never negative)."""
+    return max(0, int((end - start).total_seconds() * 1000))
+
+
+def _advance_normalization(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 1 wiring: call the normalization service and derive the next state.
+
+    The spine only invokes the subsystem and routes on its returned status — it
+    performs no normalization logic itself (no product/brief/asset inspection).
+    """
+    current = request.current_state
+    raw = request.raw_submission
+    input_ids = [raw.submission_id] if raw and raw.submission_id else []
+
+    started_at = datetime.utcnow()
+    try:
+        normalization = normalize_submission(raw)
+    except Exception as exc:  # subsystem failure -> NORMALIZATION_FAILED
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="NormalizationService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="NORMALIZATION_EXCEPTION",
+            error_message=str(exc) or "Normalization raised an exception",
+        )
+        return _result(
+            request,
+            previous_state=current,
+            current_state=S.NORMALIZATION_FAILED,
+            status=ResultStatus.FAILED,
+            stopped=True,
+            transition_check=_check(current, S.NORMALIZATION_FAILED),
+            stop_reason="Normalization service raised an exception",
+            next_steps="Investigate the normalization failure and retry.",
+            reasons=[
+                StageIssue(
+                    code="NORMALIZATION_EXCEPTION",
+                    message=str(exc) or "Normalization raised an exception",
+                )
+            ],
+            subsystem_records=[record],
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = (
+        [normalization.design_job.job_id]
+        if normalization.design_job is not None
+        else []
+    )
+    record = SubsystemExecutionRecord(
+        subsystem_name="NormalizationService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    if normalization.status == ResultStatus.PASSED:
+        target = S.NORMALIZED
+        return _result(
+            request,
+            previous_state=current,
+            current_state=target,
+            status=_run_status_for_state(target),
+            stopped=False,
+            transition_check=_check(current, target),
+            subsystem_records=[record],
+            normalization=normalization,
+        )
+
+    # Any non-PASSED outcome routes to human review.
+    target = S.NORMALIZATION_NEEDS_REVIEW
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=ResultStatus.NEEDS_REVIEW,
+        stopped=True,
+        transition_check=_check(current, target),
+        stop_reason="Normalization requires human review",
+        next_steps=(
+            normalization.next_steps
+            or "A human must review the submission before it can proceed."
+        ),
+        subsystem_records=[record],
+        normalization=normalization,
     )
 
 
@@ -191,6 +321,16 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
             stop_reason=f"Run is awaiting human action in state '{current.value}'",
             next_steps="A human decision/action is required before the run can advance.",
         )
+
+    # Phase 1: normalization wiring. When asked to advance from
+    # NORMALIZATION_PENDING with a submission and no explicit target, call the
+    # normalization subsystem and route on its result.
+    if (
+        current == S.NORMALIZATION_PENDING
+        and request.requested_target_state is None
+        and request.raw_submission is not None
+    ):
+        return _advance_normalization(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

@@ -11,6 +11,7 @@ from app.domain.print_orchestration_schemas import (
 from app.domain.print_schemas import (
     AssetRole,
     PrintWorkflowRunResult,
+    PrintWorkflowStage,
     PrintWorkflowState,
     ProductType,
     RawSubmission,
@@ -19,6 +20,7 @@ from app.domain.print_schemas import (
 )
 from app.domain.print_state_machine import get_allowed_transitions
 from app.services import print_orchestrator
+from app.services.print_normalization import normalize_submission
 from app.services.print_orchestrator import advance_workflow
 
 S = PrintWorkflowState
@@ -258,6 +260,102 @@ def test_normalization_wiring_failure_path(monkeypatch):
     result = advance_workflow(request)
 
     assert result.current_state == S.NORMALIZATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.specification is None
+
+
+# ---------------------------------------------------------------------------
+# Specification resolution wiring (Phase 2) — expected to fail until the spine
+# calls the specification service from NORMALIZED.
+# ---------------------------------------------------------------------------
+
+
+def _normalized_run_result(submission=None) -> PrintWorkflowRunResult:
+    """Build a NORMALIZED run bundle carrying a successful NormalizationResult."""
+    if submission is None:
+        submission = _raw_submission(requested_product="banner")
+    normalization = normalize_submission(submission)
+    return PrintWorkflowRunResult(
+        run_id="run-1",
+        submission_id=submission.submission_id,
+        stage=PrintWorkflowStage.NORMALIZATION,
+        state=S.NORMALIZED,
+        status=ResultStatus.PENDING,
+        raw_submission=submission,
+        normalization=normalization,
+    )
+
+
+def test_specification_wiring_success_advances():
+    run_result = _normalized_run_result()
+    design_job = run_result.normalization.design_job
+    request = _request(
+        S.NORMALIZED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.SPECIFICATION_RESOLVED
+    assert result.run_result.specification is not None
+    assert result.run_result.specification.job_id == design_job.job_id
+    assert result.run_result.specification.product_type == design_job.product_type
+    assert len(result.subsystem_records) == 1
+    assert (
+        result.subsystem_records[0].subsystem_name == "SpecificationResolutionService"
+    )
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+
+def test_specification_wiring_missing_design_job_fails():
+    run_result = PrintWorkflowRunResult(
+        run_id="run-1",
+        submission_id="sub-1",
+        stage=PrintWorkflowStage.NORMALIZATION,
+        state=S.NORMALIZED,
+        status=ResultStatus.PENDING,
+        normalization=None,
+    )
+    request = _request(
+        S.NORMALIZED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.SPECIFICATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.specification is None
+
+
+def test_specification_wiring_exception_path(monkeypatch):
+    def _boom(_design_job):
+        raise RuntimeError("specification exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator, "resolve_specification", _boom, raising=False
+    )
+
+    run_result = _normalized_run_result()
+    request = _request(
+        S.NORMALIZED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.SPECIFICATION_FAILED
     assert result.status == ResultStatus.FAILED
     assert result.stopped is True
     assert len(result.subsystem_records) == 1

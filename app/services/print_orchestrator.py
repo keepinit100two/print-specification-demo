@@ -27,6 +27,7 @@ from app.domain.print_orchestration_schemas import (
 )
 from app.domain.print_schemas import (
     NormalizationResult,
+    PrintSpecification,
     PrintWorkflowRunResult,
     PrintWorkflowStage,
     PrintWorkflowState,
@@ -40,6 +41,7 @@ from app.domain.print_state_machine import (
     is_terminal_state,
 )
 from app.services.print_normalization import normalize_submission
+from app.services.print_specification import resolve_specification
 
 S = PrintWorkflowState
 
@@ -140,11 +142,14 @@ def _result(
     reasons: Optional[list] = None,
     subsystem_records: Optional[List[SubsystemExecutionRecord]] = None,
     normalization: Optional[NormalizationResult] = None,
+    specification: Optional[PrintSpecification] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
     if normalization is not None:
         run_result.normalization = normalization
+    if specification is not None:
+        run_result.specification = specification
     return WorkflowAdvanceResult(
         run_id=request.run_id,
         idempotency_key=request.idempotency_key,
@@ -282,6 +287,115 @@ def _advance_normalization(request: WorkflowAdvanceRequest) -> WorkflowAdvanceRe
     )
 
 
+def _specification_failure(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_message: str,
+    error_code: str,
+) -> WorkflowAdvanceResult:
+    """Build a SPECIFICATION_FAILED result (specification stays None)."""
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=S.SPECIFICATION_FAILED,
+        status=ResultStatus.FAILED,
+        stopped=True,
+        transition_check=_check(current, S.SPECIFICATION_FAILED),
+        stop_reason="Specification resolution failed",
+        next_steps="Investigate the specification failure and retry.",
+        reasons=[StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+    )
+
+
+def _advance_specification(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 2 wiring: call the specification service and derive the next state.
+
+    The spine only invokes the subsystem and routes on its outcome — it does not
+    resolve specs, inspect product rules, or build any requirement objects.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    design_job = (
+        run.normalization.design_job
+        if run is not None and run.normalization is not None
+        else None
+    )
+
+    started_at = datetime.utcnow()
+
+    # Guard: a DesignJob from normalization is required to resolve a spec.
+    if design_job is None:
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="SpecificationResolutionService",
+            input_contract_ids=[],
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_DESIGN_JOB",
+            error_message="No DesignJob available from normalization to resolve a specification",
+        )
+        return _specification_failure(
+            request,
+            record=record,
+            error_message=record.error_message,
+            error_code="MISSING_DESIGN_JOB",
+        )
+
+    input_ids = [design_job.job_id]
+    try:
+        specification = resolve_specification(design_job)
+    except Exception as exc:  # subsystem failure -> SPECIFICATION_FAILED
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Specification resolution raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="SpecificationResolutionService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="SPECIFICATION_EXCEPTION",
+            error_message=message,
+        )
+        return _specification_failure(
+            request,
+            record=record,
+            error_message=message,
+            error_code="SPECIFICATION_EXCEPTION",
+        )
+
+    completed_at = datetime.utcnow()
+    record = SubsystemExecutionRecord(
+        subsystem_name="SpecificationResolutionService",
+        input_contract_ids=input_ids,
+        output_contract_ids=[specification.spec_id],
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    target = S.SPECIFICATION_RESOLVED
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=_run_status_for_state(target),
+        stopped=False,
+        transition_check=_check(current, target),
+        subsystem_records=[record],
+        specification=specification,
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -331,6 +445,11 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
         and request.raw_submission is not None
     ):
         return _advance_normalization(request)
+
+    # Phase 2: specification wiring. When asked to advance from NORMALIZED with
+    # no explicit target, resolve the specification from the run's DesignJob.
+    if current == S.NORMALIZED and request.requested_target_state is None:
+        return _advance_specification(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

@@ -215,7 +215,17 @@ class WorkflowAdvanceResult(BaseModel):
     current_state: PrintWorkflowState = Field(..., description="State after the step")
     transition_check: Optional[TransitionCheckResult] = Field(
         None,
-        description="Legality check recorded for this step's transition",
+        description=(
+            "Legality check for this step's final transition (kept for backward "
+            "compatibility; prefer transition_checks)"
+        ),
+    )
+    transition_checks: List[TransitionCheckResult] = Field(
+        default_factory=list,
+        description=(
+            "All state movements recorded during this step, in order. A single "
+            "advance may thread through intermediate states (e.g. *_PENDING)."
+        ),
     )
     run_result: PrintWorkflowRunResult = Field(
         ...,

@@ -26,6 +26,8 @@ from app.domain.print_orchestration_schemas import (
     WorkflowAdvanceResult,
 )
 from app.domain.print_schemas import (
+    AssetRole,
+    ComplianceResult,
     NormalizationResult,
     PrintSpecification,
     PrintWorkflowRunResult,
@@ -40,6 +42,7 @@ from app.domain.print_state_machine import (
     is_human_review_state,
     is_terminal_state,
 )
+from app.services.print_compliance import evaluate_compliance
 from app.services.print_normalization import normalize_submission
 from app.services.print_specification import resolve_specification
 
@@ -137,12 +140,14 @@ def _result(
     status: ResultStatus,
     stopped: bool,
     transition_check: Optional[TransitionCheckResult] = None,
+    transition_checks: Optional[List[TransitionCheckResult]] = None,
     stop_reason: Optional[str] = None,
     next_steps: Optional[str] = None,
     reasons: Optional[list] = None,
     subsystem_records: Optional[List[SubsystemExecutionRecord]] = None,
     normalization: Optional[NormalizationResult] = None,
     specification: Optional[PrintSpecification] = None,
+    compliance: Optional[ComplianceResult] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
@@ -150,13 +155,25 @@ def _result(
         run_result.normalization = normalization
     if specification is not None:
         run_result.specification = specification
+    if compliance is not None:
+        run_result.compliance = compliance
+
+    # `transition_checks` is the source of truth for all movements in this step.
+    # `transition_check` mirrors the final movement for backward compatibility.
+    if transition_checks is None:
+        checks = [transition_check] if transition_check is not None else []
+    else:
+        checks = list(transition_checks)
+    final_check = checks[-1] if checks else None
+
     return WorkflowAdvanceResult(
         run_id=request.run_id,
         idempotency_key=request.idempotency_key,
         operation=request.operation,
         previous_state=previous_state,
         current_state=current_state,
-        transition_check=transition_check,
+        transition_check=final_check,
+        transition_checks=checks,
         run_result=run_result,
         subsystem_records=subsystem_records or [],
         stopped=stopped,
@@ -302,7 +319,10 @@ def _specification_failure(
         current_state=S.SPECIFICATION_FAILED,
         status=ResultStatus.FAILED,
         stopped=True,
-        transition_check=_check(current, S.SPECIFICATION_FAILED),
+        transition_checks=[
+            _check(current, S.SPECIFICATION_PENDING),
+            _check(S.SPECIFICATION_PENDING, S.SPECIFICATION_FAILED),
+        ],
         stop_reason="Specification resolution failed",
         next_steps="Investigate the specification failure and retry.",
         reasons=[StageIssue(code=error_code, message=error_message)],
@@ -390,9 +410,174 @@ def _advance_specification(request: WorkflowAdvanceRequest) -> WorkflowAdvanceRe
         current_state=target,
         status=_run_status_for_state(target),
         stopped=False,
-        transition_check=_check(current, target),
+        transition_checks=[
+            _check(current, S.SPECIFICATION_PENDING),
+            _check(S.SPECIFICATION_PENDING, target),
+        ],
         subsystem_records=[record],
         specification=specification,
+    )
+
+
+def _primary_image_properties(run: Optional[PrintWorkflowRunResult]):
+    """Return ImageProperties of the primary submitted asset, or None."""
+    if run is None or run.raw_submission is None:
+        return None
+    for asset in run.raw_submission.assets:
+        if asset.role == AssetRole.PRIMARY:
+            return asset.properties
+    return None
+
+
+def _compliance_failed(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+) -> WorkflowAdvanceResult:
+    """Build a COMPLIANCE_FAILED result for a missing-input or exception failure."""
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=S.COMPLIANCE_FAILED,
+        status=ResultStatus.FAILED,
+        stopped=True,
+        transition_checks=[
+            _check(current, S.COMPLIANCE_PENDING),
+            _check(S.COMPLIANCE_PENDING, S.COMPLIANCE_FAILED),
+        ],
+        stop_reason="Compliance evaluation failed",
+        next_steps="Investigate the compliance failure and retry.",
+        reasons=[StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+    )
+
+
+def _advance_compliance(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 3 wiring: call the compliance service and route on its result.
+
+    The spine only invokes the subsystem and routes on its outcome — it does not
+    measure compliance, compute DPI/dimensions/formats, or build findings.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    design_job = (
+        run.normalization.design_job
+        if run is not None and run.normalization is not None
+        else None
+    )
+    specification = run.specification if run is not None else None
+    image_properties = _primary_image_properties(run)
+
+    input_ids = [
+        cid
+        for cid in (
+            getattr(design_job, "job_id", None),
+            getattr(specification, "spec_id", None),
+        )
+        if cid
+    ]
+
+    started_at = datetime.utcnow()
+
+    # Guard: required inputs must be present.
+    if design_job is None or specification is None or image_properties is None:
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="TechnicalComplianceService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_COMPLIANCE_INPUTS",
+            error_message=(
+                "Missing required inputs for compliance (design_job, specification, "
+                "or primary asset image properties)"
+            ),
+        )
+        return _compliance_failed(
+            request,
+            record=record,
+            error_code="MISSING_COMPLIANCE_INPUTS",
+            error_message=record.error_message,
+        )
+
+    try:
+        compliance = evaluate_compliance(design_job, specification, image_properties)
+    except Exception as exc:  # subsystem failure -> COMPLIANCE_FAILED
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Compliance evaluation raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="TechnicalComplianceService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="COMPLIANCE_EXCEPTION",
+            error_message=message,
+        )
+        return _compliance_failed(
+            request,
+            record=record,
+            error_code="COMPLIANCE_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    record = SubsystemExecutionRecord(
+        subsystem_name="TechnicalComplianceService",
+        input_contract_ids=input_ids,
+        output_contract_ids=[],
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    # NEEDS_REVIEW (e.g. missing image metadata) -> stop for human review.
+    if compliance.status == ResultStatus.NEEDS_REVIEW:
+        target = S.COMPLIANCE_FAILED
+        return _result(
+            request,
+            previous_state=current,
+            current_state=target,
+            status=ResultStatus.NEEDS_REVIEW,
+            stopped=True,
+            transition_checks=[
+                _check(current, S.COMPLIANCE_PENDING),
+                _check(S.COMPLIANCE_PENDING, target),
+            ],
+            stop_reason="Compliance requires human review",
+            next_steps=(
+                compliance.next_steps
+                or "Compliance could not be measured; human review required."
+            ),
+            subsystem_records=[record],
+            compliance=compliance,
+        )
+
+    # PASSED or FAILED: the measurement succeeded. FAILED simply means the asset
+    # is not print-ready — it is not a workflow failure.
+    target = S.COMPLIANCE_COMPLETE
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=_run_status_for_state(target),
+        stopped=False,
+        transition_checks=[
+            _check(current, S.COMPLIANCE_PENDING),
+            _check(S.COMPLIANCE_PENDING, target),
+        ],
+        subsystem_records=[record],
+        compliance=compliance,
     )
 
 
@@ -450,6 +635,11 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     # no explicit target, resolve the specification from the run's DesignJob.
     if current == S.NORMALIZED and request.requested_target_state is None:
         return _advance_specification(request)
+
+    # Phase 3: compliance wiring. When asked to advance from SPECIFICATION_RESOLVED
+    # with no explicit target, measure the submitted asset against the spec.
+    if current == S.SPECIFICATION_RESOLVED and request.requested_target_state is None:
+        return _advance_compliance(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

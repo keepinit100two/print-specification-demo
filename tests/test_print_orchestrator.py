@@ -1,3 +1,4 @@
+import math
 import uuid
 
 import pytest
@@ -10,6 +11,9 @@ from app.domain.print_orchestration_schemas import (
 )
 from app.domain.print_schemas import (
     AssetRole,
+    DesignJob,
+    ImageProperties,
+    NormalizationResult,
     PrintWorkflowRunResult,
     PrintWorkflowStage,
     PrintWorkflowState,
@@ -21,6 +25,7 @@ from app.domain.print_schemas import (
 from app.domain.print_state_machine import get_allowed_transitions
 from app.services import print_orchestrator
 from app.services.print_normalization import normalize_submission
+from app.services.print_specification import resolve_specification
 from app.services.print_orchestrator import advance_workflow
 
 S = PrintWorkflowState
@@ -40,6 +45,10 @@ def _request(
         requested_target_state=target,
         **kwargs,
     )
+
+
+def _transition_pairs(result):
+    return [(c.from_state, c.to_state) for c in result.transition_checks]
 
 
 TERMINAL_STATES = [S.COMPLETED, S.FAILED, S.CANCELLED]
@@ -311,6 +320,11 @@ def test_specification_wiring_success_advances():
     )
     assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
 
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.NORMALIZED, S.SPECIFICATION_PENDING) in pairs
+    assert (S.SPECIFICATION_PENDING, S.SPECIFICATION_RESOLVED) in pairs
+
 
 def test_specification_wiring_missing_design_job_fails():
     run_result = PrintWorkflowRunResult(
@@ -337,6 +351,11 @@ def test_specification_wiring_missing_design_job_fails():
     assert result.subsystem_records[0].error_message
     assert result.run_result.specification is None
 
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.NORMALIZED, S.SPECIFICATION_PENDING) in pairs
+    assert (S.SPECIFICATION_PENDING, S.SPECIFICATION_FAILED) in pairs
+
 
 def test_specification_wiring_exception_path(monkeypatch):
     def _boom(_design_job):
@@ -362,3 +381,208 @@ def test_specification_wiring_exception_path(monkeypatch):
     assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
     assert result.subsystem_records[0].error_message
     assert result.run_result.specification is None
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.NORMALIZED, S.SPECIFICATION_PENDING) in pairs
+    assert (S.SPECIFICATION_PENDING, S.SPECIFICATION_FAILED) in pairs
+
+
+# ---------------------------------------------------------------------------
+# Technical compliance wiring (Phase 3) — expected to fail until the spine
+# calls the compliance service from SPECIFICATION_RESOLVED.
+# ---------------------------------------------------------------------------
+
+
+def _required_px(spec):
+    w = math.ceil(spec.dimensions.width_mm / 25.4 * spec.dimensions.min_dpi) + 100
+    h = math.ceil(spec.dimensions.height_mm / 25.4 * spec.dimensions.min_dpi) + 100
+    return w, h
+
+
+def _compliant_image(spec) -> ImageProperties:
+    width_px, height_px = _required_px(spec)
+    return ImageProperties(
+        width_px=width_px,
+        height_px=height_px,
+        dpi=spec.dimensions.min_dpi,
+        color_profile=spec.color.color_profile or spec.color.color_mode,
+        file_format=spec.accepted_formats[0],
+    )
+
+
+def _spec_resolved_run_result(
+    image_properties=None,
+    product_type=ProductType.BANNER,
+    include_specification=True,
+):
+    """Build a SPECIFICATION_RESOLVED run bundle with a primary asset present."""
+    submission_id = str(uuid.uuid4())
+    design_job = DesignJob(
+        job_id=f"job-{submission_id}",
+        submission_id=submission_id,
+        product_type=product_type,
+        title="Summer sale",
+        normalized_brief="A bold outdoor banner advertising a summer sale.",
+        requested_quantity=1,
+    )
+    spec = resolve_specification(design_job)
+
+    if image_properties is None:
+        image_properties = _compliant_image(spec)
+
+    asset = SubmittedAsset(
+        asset_id=str(uuid.uuid4()),
+        role=AssetRole.PRIMARY,
+        uri="file:///tmp/asset.png",
+        properties=image_properties,
+    )
+    submission = RawSubmission(
+        submission_id=submission_id,
+        requester="designer@example.com",
+        requested_product="banner",
+        brief="A bold outdoor banner advertising a summer sale.",
+        assets=[asset],
+    )
+    normalization = NormalizationResult(
+        status=ResultStatus.PASSED,
+        design_job=design_job,
+    )
+    run_result = PrintWorkflowRunResult(
+        run_id="run-1",
+        submission_id=submission_id,
+        stage=PrintWorkflowStage.SPECIFICATION,
+        state=S.SPECIFICATION_RESOLVED,
+        status=ResultStatus.PENDING,
+        raw_submission=submission,
+        normalization=normalization,
+        specification=spec if include_specification else None,
+    )
+    return run_result, design_job, spec
+
+
+def test_compliance_wiring_compliant_advances():
+    run_result, design_job, spec = _spec_resolved_run_result()
+    request = _request(
+        S.SPECIFICATION_RESOLVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.COMPLIANCE_COMPLETE
+    assert result.run_result.compliance is not None
+    assert result.run_result.compliance.status == ResultStatus.PASSED
+    assert result.run_result.compliance.is_print_ready is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "TechnicalComplianceService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.SPECIFICATION_RESOLVED, S.COMPLIANCE_PENDING) in pairs
+    assert (S.COMPLIANCE_PENDING, S.COMPLIANCE_COMPLETE) in pairs
+
+
+def test_compliance_wiring_non_compliant_completes_not_print_ready():
+    run_result, design_job, spec = _spec_resolved_run_result()
+    # Knock DPI below the spec minimum on the submitted asset.
+    run_result.raw_submission.assets[0].properties.dpi = spec.dimensions.min_dpi - 150
+    request = _request(
+        S.SPECIFICATION_RESOLVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.COMPLIANCE_COMPLETE
+    assert result.run_result.compliance.status == ResultStatus.FAILED
+    assert result.run_result.compliance.is_print_ready is False
+    assert any(
+        f.requirement == "min_dpi" for f in result.run_result.compliance.findings
+    )
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.SPECIFICATION_RESOLVED, S.COMPLIANCE_PENDING) in pairs
+    assert (S.COMPLIANCE_PENDING, S.COMPLIANCE_COMPLETE) in pairs
+
+
+def test_compliance_wiring_missing_metadata_routes_to_failed():
+    image = ImageProperties(
+        width_px=None,
+        height_px=None,
+        dpi=None,
+        file_format="pdf",
+    )
+    run_result, design_job, spec = _spec_resolved_run_result(image_properties=image)
+    request = _request(
+        S.SPECIFICATION_RESOLVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.COMPLIANCE_FAILED
+    assert result.status in (ResultStatus.FAILED, ResultStatus.NEEDS_REVIEW)
+    assert result.stopped is True
+    assert result.run_result.compliance is not None
+    assert result.run_result.compliance.status == ResultStatus.NEEDS_REVIEW
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+
+def test_compliance_wiring_missing_spec_fails_safely():
+    run_result, design_job, spec = _spec_resolved_run_result(include_specification=False)
+    request = _request(
+        S.SPECIFICATION_RESOLVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.COMPLIANCE_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.SPECIFICATION_RESOLVED, S.COMPLIANCE_PENDING) in pairs
+    assert (S.COMPLIANCE_PENDING, S.COMPLIANCE_FAILED) in pairs
+
+
+def test_compliance_wiring_exception_path(monkeypatch):
+    def _boom(design_job, specification, image_properties):
+        raise RuntimeError("compliance exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator, "evaluate_compliance", _boom, raising=False
+    )
+
+    run_result, design_job, spec = _spec_resolved_run_result()
+    request = _request(
+        S.SPECIFICATION_RESOLVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.COMPLIANCE_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.SPECIFICATION_RESOLVED, S.COMPLIANCE_PENDING) in pairs
+    assert (S.COMPLIANCE_PENDING, S.COMPLIANCE_FAILED) in pairs

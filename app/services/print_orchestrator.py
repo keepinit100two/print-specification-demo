@@ -29,6 +29,7 @@ from app.domain.print_schemas import (
     AdaptationPlan,
     AssetRole,
     ComplianceResult,
+    GenerationRequest,
     NormalizationResult,
     PrintSpecification,
     PrintWorkflowRunResult,
@@ -46,6 +47,7 @@ from app.domain.print_state_machine import (
 from app.services.print_adaptation import create_adaptation_plan
 from app.services.print_compliance import evaluate_compliance
 from app.services.print_normalization import normalize_submission
+from app.services.print_prompt_construction import build_generation_request
 from app.services.print_specification import resolve_specification
 
 S = PrintWorkflowState
@@ -151,6 +153,7 @@ def _result(
     specification: Optional[PrintSpecification] = None,
     compliance: Optional[ComplianceResult] = None,
     adaptation: Optional[AdaptationPlan] = None,
+    generation_request: Optional[GenerationRequest] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
@@ -162,6 +165,8 @@ def _result(
         run_result.compliance = compliance
     if adaptation is not None:
         run_result.adaptation = adaptation
+    if generation_request is not None:
+        run_result.generation_request = generation_request
 
     # `transition_checks` is the source of truth for all movements in this step.
     # `transition_check` mirrors the final movement for backward compatibility.
@@ -729,6 +734,148 @@ def _advance_adaptation(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResul
     )
 
 
+def _prompt_failed(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+) -> WorkflowAdvanceResult:
+    """Build a FAILED result for a missing-input or exception prompt failure."""
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=S.FAILED,
+        status=ResultStatus.FAILED,
+        stopped=True,
+        transition_checks=[_check(current, S.FAILED)],
+        stop_reason="Prompt construction failed",
+        next_steps="Investigate the prompt construction failure and retry.",
+        reasons=[StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+    )
+
+
+def _advance_prompt(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 5 wiring: build a GenerationRequest when adaptation requires generation.
+
+    The spine only checks adaptation.requires_generation as a routing flag and
+    invokes the subsystem — it does not construct prompt text itself.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    design_job = (
+        run.normalization.design_job
+        if run is not None and run.normalization is not None
+        else None
+    )
+    specification = run.specification if run is not None else None
+    adaptation = run.adaptation if run is not None else None
+
+    input_ids = [
+        cid
+        for cid in (
+            getattr(design_job, "job_id", None),
+            getattr(specification, "spec_id", None),
+            getattr(adaptation, "plan_id", None),
+        )
+        if cid
+    ]
+
+    started_at = datetime.utcnow()
+
+    # Guard: required inputs must be present.
+    if design_job is None or specification is None or adaptation is None:
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="PromptConstructionService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_PROMPT_INPUTS",
+            error_message=(
+                "Missing required inputs for prompt construction (design_job, "
+                "specification, or adaptation plan)"
+            ),
+        )
+        return _prompt_failed(
+            request,
+            record=record,
+            error_code="MISSING_PROMPT_INPUTS",
+            error_message=record.error_message,
+        )
+
+    # Routing flag only: no generation needed. Do not call the subsystem.
+    if not adaptation.requires_generation:
+        return _result(
+            request,
+            previous_state=current,
+            current_state=current,
+            status=ResultStatus.PENDING,
+            stopped=True,
+            stop_reason="Adaptation does not require generation",
+            next_steps="No generation request is needed; proceed without prompt construction.",
+        )
+
+    try:
+        generation_request = build_generation_request(
+            design_job, specification, adaptation
+        )
+    except Exception as exc:  # subsystem failure -> FAILED
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Prompt construction raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="PromptConstructionService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="PROMPT_EXCEPTION",
+            error_message=message,
+        )
+        return _prompt_failed(
+            request,
+            record=record,
+            error_code="PROMPT_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = (
+        [generation_request.request_id]
+        if getattr(generation_request, "request_id", None)
+        else []
+    )
+    record = SubsystemExecutionRecord(
+        subsystem_name="PromptConstructionService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    target = S.GENERATION_PENDING
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=_run_status_for_state(target),
+        stopped=False,
+        transition_checks=[_check(current, target)],
+        subsystem_records=[record],
+        generation_request=generation_request,
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -793,6 +940,12 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     # with no explicit target, decide whether adaptation is required.
     if current == S.COMPLIANCE_COMPLETE and request.requested_target_state is None:
         return _advance_adaptation(request)
+
+    # Phase 5: prompt construction wiring. When asked to advance from
+    # ADAPTATION_PLANNED with no explicit target, build a GenerationRequest if
+    # adaptation requires generation.
+    if current == S.ADAPTATION_PLANNED and request.requested_target_state is None:
+        return _advance_prompt(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

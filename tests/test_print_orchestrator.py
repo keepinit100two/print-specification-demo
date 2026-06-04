@@ -10,6 +10,7 @@ from app.domain.print_orchestration_schemas import (
     WorkflowOperation,
 )
 from app.domain.print_schemas import (
+    AdaptationPlan,
     AssetRole,
     DesignJob,
     ImageProperties,
@@ -21,6 +22,8 @@ from app.domain.print_schemas import (
     RawSubmission,
     ResultStatus,
     SubmittedAsset,
+    TransformationStep,
+    TransformationType,
 )
 from app.domain.print_state_machine import get_allowed_transitions
 from app.services import print_orchestrator
@@ -726,5 +729,154 @@ def test_adaptation_wiring_exception_path(monkeypatch):
     assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
     assert result.subsystem_records[0].error_message
     assert result.run_result.adaptation is None
+
+    assert all(c.allowed for c in result.transition_checks)
+
+
+# ---------------------------------------------------------------------------
+# Prompt construction wiring (Phase 5) — expected to fail until the spine calls
+# the prompt construction service from ADAPTATION_PLANNED.
+#
+# The spine only calls build_generation_request when adaptation.requires_generation
+# is True; otherwise it stops (no generation request needed). The legal success
+# transition is ADAPTATION_PLANNED -> GENERATION_PENDING, and the only legal
+# failure target used here is the terminal FAILED state.
+# ---------------------------------------------------------------------------
+
+
+def _adaptation_planned_run_result(requires_generation=True):
+    """Build an ADAPTATION_PLANNED run bundle carrying design_job, spec, adaptation."""
+    run_result, design_job, spec = _spec_resolved_run_result()
+
+    if requires_generation:
+        adaptation = AdaptationPlan(
+            plan_id=f"plan-{design_job.job_id}",
+            spec_id=spec.spec_id,
+            job_id=design_job.job_id,
+            status=ResultStatus.PASSED,
+            requires_generation=True,
+            steps=[
+                TransformationStep(
+                    transformation=TransformationType.UPSCALE,
+                    target_asset_role=AssetRole.PRIMARY,
+                    parameters={"requirement": "min_dpi"},
+                    reason="Resolve min_dpi: upscale to meet required DPI",
+                )
+            ],
+        )
+    else:
+        adaptation = AdaptationPlan(
+            plan_id=f"plan-{design_job.job_id}",
+            spec_id=spec.spec_id,
+            job_id=design_job.job_id,
+            status=ResultStatus.SKIPPED,
+            requires_generation=False,
+            steps=[],
+        )
+
+    run_result.adaptation = adaptation
+    run_result.stage = PrintWorkflowStage.ADAPTATION
+    run_result.state = S.ADAPTATION_PLANNED
+    run_result.status = ResultStatus.PENDING
+    return run_result, design_job, spec, adaptation
+
+
+def test_prompt_wiring_requires_generation_creates_request():
+    run_result, design_job, spec, adaptation = _adaptation_planned_run_result(
+        requires_generation=True
+    )
+    request = _request(
+        S.ADAPTATION_PLANNED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.GENERATION_PENDING
+    assert result.run_result.generation_request is not None
+    assert result.run_result.generation_request.job_id == design_job.job_id
+    assert result.run_result.generation_request.spec_id == spec.spec_id
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "PromptConstructionService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.ADAPTATION_PLANNED, S.GENERATION_PENDING) in pairs
+
+
+def test_prompt_wiring_skips_when_no_generation_required():
+    run_result, design_job, spec, adaptation = _adaptation_planned_run_result(
+        requires_generation=False
+    )
+    request = _request(
+        S.ADAPTATION_PLANNED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    # The prompt construction service must not be called and no request created.
+    assert result.run_result.generation_request is None
+    assert result.subsystem_records == []
+    assert result.stopped is True
+    assert result.next_steps is not None
+    assert result.current_state != S.GENERATION_PENDING
+
+
+def test_prompt_wiring_missing_adaptation_fails_safely():
+    run_result, design_job, spec = _spec_resolved_run_result()
+    run_result.stage = PrintWorkflowStage.ADAPTATION
+    run_result.state = S.ADAPTATION_PLANNED
+    run_result.status = ResultStatus.PENDING
+    # adaptation is intentionally left as None.
+
+    request = _request(
+        S.ADAPTATION_PLANNED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.generation_request is None
+
+    assert all(c.allowed for c in result.transition_checks)
+
+
+def test_prompt_wiring_exception_path(monkeypatch):
+    def _boom(design_job, specification, adaptation_plan):
+        raise RuntimeError("prompt construction exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator, "build_generation_request", _boom, raising=False
+    )
+
+    run_result, design_job, spec, adaptation = _adaptation_planned_run_result(
+        requires_generation=True
+    )
+    request = _request(
+        S.ADAPTATION_PLANNED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.generation_request is None
 
     assert all(c.allowed for c in result.transition_checks)

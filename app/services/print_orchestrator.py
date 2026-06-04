@@ -26,6 +26,7 @@ from app.domain.print_orchestration_schemas import (
     WorkflowAdvanceResult,
 )
 from app.domain.print_schemas import (
+    AdaptationPlan,
     AssetRole,
     ComplianceResult,
     NormalizationResult,
@@ -42,6 +43,7 @@ from app.domain.print_state_machine import (
     is_human_review_state,
     is_terminal_state,
 )
+from app.services.print_adaptation import create_adaptation_plan
 from app.services.print_compliance import evaluate_compliance
 from app.services.print_normalization import normalize_submission
 from app.services.print_specification import resolve_specification
@@ -148,6 +150,7 @@ def _result(
     normalization: Optional[NormalizationResult] = None,
     specification: Optional[PrintSpecification] = None,
     compliance: Optional[ComplianceResult] = None,
+    adaptation: Optional[AdaptationPlan] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
@@ -157,6 +160,8 @@ def _result(
         run_result.specification = specification
     if compliance is not None:
         run_result.compliance = compliance
+    if adaptation is not None:
+        run_result.adaptation = adaptation
 
     # `transition_checks` is the source of truth for all movements in this step.
     # `transition_check` mirrors the final movement for backward compatibility.
@@ -581,6 +586,149 @@ def _advance_compliance(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResul
     )
 
 
+def _adaptation_failed(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+) -> WorkflowAdvanceResult:
+    """Build a FAILED result for a missing-input or exception adaptation failure.
+
+    The state machine has no dedicated ADAPTATION_FAILED state; the only legal
+    failure target from COMPLIANCE_COMPLETE is the terminal FAILED state.
+    """
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=S.FAILED,
+        status=ResultStatus.FAILED,
+        stopped=True,
+        transition_checks=[_check(current, S.FAILED)],
+        stop_reason="Adaptation planning failed",
+        next_steps="Investigate the adaptation failure and retry.",
+        reasons=[StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+    )
+
+
+def _advance_adaptation(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 4 wiring: decide whether adaptation is required and, if so, call the
+    adaptation planning service.
+
+    The spine only checks compliance.is_print_ready as a routing flag and invokes
+    the subsystem — it does not inspect findings or plan transformations itself.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    design_job = (
+        run.normalization.design_job
+        if run is not None and run.normalization is not None
+        else None
+    )
+    specification = run.specification if run is not None else None
+    compliance = run.compliance if run is not None else None
+
+    input_ids = [
+        cid
+        for cid in (
+            getattr(design_job, "job_id", None),
+            getattr(specification, "spec_id", None),
+        )
+        if cid
+    ]
+
+    started_at = datetime.utcnow()
+
+    # Guard: required inputs must be present.
+    if design_job is None or specification is None or compliance is None:
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="AdaptationPlanningService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_ADAPTATION_INPUTS",
+            error_message=(
+                "Missing required inputs for adaptation planning (design_job, "
+                "specification, or compliance result)"
+            ),
+        )
+        return _adaptation_failed(
+            request,
+            record=record,
+            error_code="MISSING_ADAPTATION_INPUTS",
+            error_message=record.error_message,
+        )
+
+    # Routing flag only: a print-ready asset needs no adaptation. Do not call the
+    # subsystem and do not create an AdaptationPlan.
+    if compliance.is_print_ready:
+        return _result(
+            request,
+            previous_state=current,
+            current_state=current,
+            status=ResultStatus.PENDING,
+            stopped=True,
+            stop_reason="Asset is print-ready; no adaptation required",
+            next_steps="No adaptation required; proceed to production packaging.",
+        )
+
+    try:
+        adaptation = create_adaptation_plan(design_job, specification, compliance)
+    except Exception as exc:  # subsystem failure -> FAILED
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Adaptation planning raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="AdaptationPlanningService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="ADAPTATION_EXCEPTION",
+            error_message=message,
+        )
+        return _adaptation_failed(
+            request,
+            record=record,
+            error_code="ADAPTATION_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = (
+        [adaptation.plan_id] if getattr(adaptation, "plan_id", None) else []
+    )
+    record = SubsystemExecutionRecord(
+        subsystem_name="AdaptationPlanningService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    target = S.ADAPTATION_PLANNED
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=_run_status_for_state(target),
+        stopped=False,
+        transition_checks=[_check(current, target)],
+        subsystem_records=[record],
+        adaptation=adaptation,
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -640,6 +788,11 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     # with no explicit target, measure the submitted asset against the spec.
     if current == S.SPECIFICATION_RESOLVED and request.requested_target_state is None:
         return _advance_compliance(request)
+
+    # Phase 4: adaptation wiring. When asked to advance from COMPLIANCE_COMPLETE
+    # with no explicit target, decide whether adaptation is required.
+    if current == S.COMPLIANCE_COMPLETE and request.requested_target_state is None:
+        return _advance_adaptation(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

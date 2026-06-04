@@ -26,9 +26,15 @@ from app.domain.print_state_machine import get_allowed_transitions
 from app.services import print_orchestrator
 from app.services.print_normalization import normalize_submission
 from app.services.print_specification import resolve_specification
+from app.services.print_compliance import evaluate_compliance
 from app.services.print_orchestrator import advance_workflow
 
 S = PrintWorkflowState
+
+# The state machine has no dedicated ADAPTATION_FAILED state. The only legal
+# failure transition out of COMPLIANCE_COMPLETE is to the terminal FAILED state,
+# so adaptation failures route there.
+ADAPTATION_FAILURE_STATE = S.FAILED
 
 
 def _request(
@@ -586,3 +592,139 @@ def test_compliance_wiring_exception_path(monkeypatch):
     pairs = _transition_pairs(result)
     assert (S.SPECIFICATION_RESOLVED, S.COMPLIANCE_PENDING) in pairs
     assert (S.COMPLIANCE_PENDING, S.COMPLIANCE_FAILED) in pairs
+
+
+# ---------------------------------------------------------------------------
+# Adaptation planning wiring (Phase 4) — expected to fail until the spine calls
+# the adaptation service from COMPLIANCE_COMPLETE.
+#
+# Note: the state machine has a single ADAPTATION_PLANNED state (no
+# ADAPTATION_PENDING), so adaptation records one transition:
+#   COMPLIANCE_COMPLETE -> ADAPTATION_PLANNED.
+# There is no ADAPTATION_FAILED state; adaptation failures route to the only
+# legal failure target from COMPLIANCE_COMPLETE, the terminal FAILED state.
+# ---------------------------------------------------------------------------
+
+
+def _compliance_complete_run_result(print_ready=True):
+    """Build a COMPLIANCE_COMPLETE run bundle carrying design_job, spec, compliance."""
+    run_result, design_job, spec = _spec_resolved_run_result()
+    asset = run_result.raw_submission.assets[0]
+    if not print_ready:
+        # Knock DPI below spec so the asset is measured as not print-ready.
+        asset.properties.dpi = spec.dimensions.min_dpi - 150
+
+    compliance = evaluate_compliance(design_job, spec, asset.properties)
+    run_result.compliance = compliance
+    run_result.stage = PrintWorkflowStage.COMPLIANCE
+    run_result.state = S.COMPLIANCE_COMPLETE
+    run_result.status = ResultStatus.PENDING
+    return run_result, design_job, spec, compliance
+
+
+def test_adaptation_wiring_not_print_ready_creates_plan():
+    run_result, design_job, spec, compliance = _compliance_complete_run_result(
+        print_ready=False
+    )
+    assert compliance.status == ResultStatus.FAILED
+    assert compliance.is_print_ready is False
+
+    request = _request(
+        S.COMPLIANCE_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.ADAPTATION_PLANNED
+    assert result.run_result.adaptation is not None
+    assert result.run_result.adaptation.steps
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "AdaptationPlanningService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.COMPLIANCE_COMPLETE, S.ADAPTATION_PLANNED) in pairs
+
+
+def test_adaptation_wiring_print_ready_skips_adaptation():
+    run_result, design_job, spec, compliance = _compliance_complete_run_result(
+        print_ready=True
+    )
+    assert compliance.status == ResultStatus.PASSED
+    assert compliance.is_print_ready is True
+
+    request = _request(
+        S.COMPLIANCE_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    # The adaptation service must not be called and no plan should be created.
+    assert result.run_result.adaptation is None
+    assert result.subsystem_records == []
+    assert all(
+        r.subsystem_name != "AdaptationPlanningService"
+        for r in result.subsystem_records
+    )
+    assert result.current_state != S.ADAPTATION_PLANNED
+
+
+def test_adaptation_wiring_missing_compliance_fails_safely():
+    run_result, design_job, spec = _spec_resolved_run_result()
+    run_result.stage = PrintWorkflowStage.COMPLIANCE
+    run_result.state = S.COMPLIANCE_COMPLETE
+    run_result.status = ResultStatus.PENDING
+    # compliance is intentionally left as None.
+
+    request = _request(
+        S.COMPLIANCE_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == ADAPTATION_FAILURE_STATE
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.adaptation is None
+
+    assert all(c.allowed for c in result.transition_checks)
+
+
+def test_adaptation_wiring_exception_path(monkeypatch):
+    def _boom(design_job, specification, compliance_result):
+        raise RuntimeError("adaptation exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator, "create_adaptation_plan", _boom, raising=False
+    )
+
+    run_result, design_job, spec, compliance = _compliance_complete_run_result(
+        print_ready=False
+    )
+    request = _request(
+        S.COMPLIANCE_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == ADAPTATION_FAILURE_STATE
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.adaptation is None
+
+    assert all(c.allowed for c in result.transition_checks)

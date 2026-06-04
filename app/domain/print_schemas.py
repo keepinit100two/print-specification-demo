@@ -540,6 +540,10 @@ class AdaptationPlan(BaseModel):
     plan_id: str = Field(..., description="Unique id for this plan")
     spec_id: str = Field(..., description="PrintSpecification the plan targets")
     job_id: str = Field(..., description="DesignJob the plan applies to")
+    status: ResultStatus = Field(
+        ResultStatus.PENDING,
+        description="Outcome of planning (PASSED when a plan exists, SKIPPED when none needed)",
+    )
     requires_generation: bool = Field(
         False,
         description="True if generation is needed (deterministic transforms insufficient)",
@@ -555,6 +559,10 @@ class AdaptationPlan(BaseModel):
     warnings: List[StageIssue] = Field(
         default_factory=list,
         description="Risks/limitations of the plan",
+    )
+    next_steps: Optional[str] = Field(
+        None,
+        description="Human-readable guidance on what should happen next",
     )
     provenance: Optional[ContractProvenance] = Field(
         None,

@@ -27,6 +27,7 @@ from app.domain.print_schemas import (
     SubmittedAsset,
     TransformationStep,
     TransformationType,
+    ValidationResult,
 )
 from app.domain.print_state_machine import get_allowed_transitions
 from app.services import print_orchestrator
@@ -1470,3 +1471,135 @@ def test_validation_wiring_exception_path(monkeypatch):
     pairs = _transition_pairs(result)
     assert (S.GENERATION_COMPLETE, S.VALIDATION_PENDING) in pairs
     assert (S.VALIDATION_PENDING, S.VALIDATION_FAILED) in pairs
+
+
+# ---------------------------------------------------------------------------
+# Approval package routing (Phase 9) — expected to fail until the spine calls
+# create_approval_package from VALIDATION_COMPLETE.
+#
+# Routes a passed validation into owner review; does not record ApprovalDecision
+# or create a production package.
+#
+# Legal success transition:
+#   VALIDATION_COMPLETE -> OWNER_REVIEW_PENDING
+# ---------------------------------------------------------------------------
+
+
+def _validation_complete_run_result(
+    *,
+    include_validation=True,
+    include_specification=True,
+    include_design_job=True,
+    include_candidates=True,
+):
+    """Build a VALIDATION_COMPLETE run bundle ready for approval routing."""
+    run_result, spec, candidate = _generation_complete_run_result(
+        include_specification=include_specification,
+        include_candidates=include_candidates,
+    )
+
+    if not include_design_job:
+        run_result.normalization = None
+
+    if include_validation and candidate is not None:
+        run_result.validation = ValidationResult(
+            status=ResultStatus.PASSED,
+            spec_id=spec.spec_id,
+            validated_candidate_ids=[candidate.candidate_id],
+            passed_candidate_ids=[candidate.candidate_id],
+            next_steps="Proceed to owner review.",
+        )
+    else:
+        run_result.validation = None
+
+    run_result.state = S.VALIDATION_COMPLETE
+    run_result.stage = PrintWorkflowStage.VALIDATION
+    run_result.status = ResultStatus.PENDING
+    return run_result, spec, candidate
+
+
+def test_approval_wiring_creates_package_and_routes_to_review():
+    run_result, spec, candidate = _validation_complete_run_result()
+    request = _request(
+        S.VALIDATION_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.OWNER_REVIEW_PENDING
+    assert result.run_result.approval_package is not None
+    assert result.run_result.approval_package.status == ResultStatus.PENDING
+    assert candidate.candidate_id in result.run_result.approval_package.candidate_ids
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ApprovalWorkflowService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.VALIDATION_COMPLETE, S.OWNER_REVIEW_PENDING) in pairs
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "validation",
+        "specification",
+        "design_job",
+    ],
+)
+def test_approval_wiring_missing_inputs_fail_safely(missing_field):
+    run_result, spec, candidate = _validation_complete_run_result()
+
+    if missing_field == "validation":
+        run_result.validation = None
+    elif missing_field == "specification":
+        run_result.specification = None
+    else:
+        run_result.normalization = None
+
+    request = _request(
+        S.VALIDATION_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ApprovalWorkflowService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.approval_package is None
+
+
+def test_approval_wiring_exception_path(monkeypatch):
+    def _boom(validation_result, outputs, specification, design_job):
+        raise RuntimeError("approval package exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator,
+        "create_approval_package",
+        _boom,
+        raising=False,
+    )
+
+    run_result, spec, candidate = _validation_complete_run_result()
+    request = _request(
+        S.VALIDATION_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ApprovalWorkflowService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.approval_package is None

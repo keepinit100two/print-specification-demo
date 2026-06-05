@@ -27,6 +27,7 @@ from app.domain.print_orchestration_schemas import (
 )
 from app.domain.print_schemas import (
     AdaptationPlan,
+    ApprovalPackage,
     AssetRole,
     ComplianceResult,
     GeneratedCandidate,
@@ -49,6 +50,7 @@ from app.domain.print_state_machine import (
     is_terminal_state,
 )
 from app.services.print_adaptation import create_adaptation_plan
+from app.services.print_approval import create_approval_package
 from app.services.print_compliance import evaluate_compliance
 from app.services.print_deterministic_transform import execute_deterministic_transforms
 from app.services.print_generation import generate_candidates
@@ -167,6 +169,7 @@ def _result(
     candidates: Optional[List[GeneratedCandidate]] = None,
     model_invocations: Optional[List[ModelInvocationRecord]] = None,
     validation: Optional[ValidationResult] = None,
+    approval_package: Optional[ApprovalPackage] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
@@ -186,6 +189,8 @@ def _result(
         run_result.model_invocations = model_invocations
     if validation is not None:
         run_result.validation = validation
+    if approval_package is not None:
+        run_result.approval_package = approval_package
 
     # `transition_checks` is the source of truth for all movements in this step.
     # `transition_check` mirrors the final movement for backward compatibility.
@@ -1416,6 +1421,142 @@ def _advance_validation(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResul
     )
 
 
+def _approval_failed(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+) -> WorkflowAdvanceResult:
+    """Build a terminal FAILED result for approval package routing failures."""
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=S.FAILED,
+        status=ResultStatus.FAILED,
+        stopped=True,
+        transition_checks=[_check(current, S.FAILED)],
+        stop_reason="Approval package routing failed",
+        next_steps="Investigate the approval routing failure and retry.",
+        reasons=[StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+    )
+
+
+def _advance_approval(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 9 wiring: assemble an ApprovalPackage after validation passes.
+
+    The spine only invokes create_approval_package — it does not record
+    ApprovalDecision, create ProductionPackage, call AI, or perform file I/O.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    validation = run.validation if run is not None else None
+    specification = run.specification if run is not None else None
+    design_job = (
+        run.normalization.design_job
+        if run is not None and run.normalization is not None
+        else None
+    )
+    outputs = run.candidates if run is not None else []
+
+    input_ids = [
+        cid
+        for cid in (
+            getattr(validation, "spec_id", None),
+            getattr(specification, "spec_id", None),
+            getattr(design_job, "job_id", None),
+        )
+        if cid
+    ]
+
+    started_at = datetime.utcnow()
+
+    if (
+        run is None
+        or validation is None
+        or specification is None
+        or design_job is None
+    ):
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="ApprovalWorkflowService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_APPROVAL_INPUTS",
+            error_message=(
+                "Missing required inputs for approval routing (existing_run_result, "
+                "validation, specification, or design_job)"
+            ),
+        )
+        return _approval_failed(
+            request,
+            record=record,
+            error_code="MISSING_APPROVAL_INPUTS",
+            error_message=record.error_message,
+        )
+
+    try:
+        package = create_approval_package(
+            validation,
+            outputs,
+            specification,
+            design_job,
+        )
+    except Exception as exc:
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Approval package routing raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="ApprovalWorkflowService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="APPROVAL_EXCEPTION",
+            error_message=message,
+        )
+        return _approval_failed(
+            request,
+            record=record,
+            error_code="APPROVAL_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = [package.package_id] if package.package_id else []
+    record = SubsystemExecutionRecord(
+        subsystem_name="ApprovalWorkflowService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    target = S.OWNER_REVIEW_PENDING
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=ResultStatus.NEEDS_REVIEW,
+        stopped=True,
+        transition_checks=[_check(current, target)],
+        stop_reason="Run is awaiting owner review",
+        next_steps=package.next_steps or "A human approval decision is required.",
+        subsystem_records=[record],
+        approval_package=package,
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -1509,6 +1650,12 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
         and request.requested_target_state is None
     ):
         return _advance_validation(request)
+
+    # Phase 9: approval package routing. When asked to advance from
+    # VALIDATION_COMPLETE with no explicit target, assemble an ApprovalPackage
+    # for owner review.
+    if current == S.VALIDATION_COMPLETE and request.requested_target_state is None:
+        return _advance_approval(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

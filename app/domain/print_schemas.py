@@ -85,6 +85,10 @@ class PrintWorkflowState(str, Enum):
 
     ADAPTATION_PLANNED = "adaptation_planned"
 
+    DETERMINISTIC_TRANSFORM_PENDING = "deterministic_transform_pending"
+    DETERMINISTIC_TRANSFORM_COMPLETE = "deterministic_transform_complete"
+    DETERMINISTIC_TRANSFORM_FAILED = "deterministic_transform_failed"
+
     GENERATION_PENDING = "generation_pending"
     GENERATION_RUNNING = "generation_running"
     GENERATION_COMPLETE = "generation_complete"

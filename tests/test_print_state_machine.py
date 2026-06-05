@@ -39,6 +39,19 @@ ILLEGAL_SKIPS = [
     (S.COMPLIANCE_PENDING, S.GENERATION_PENDING),
     (S.GENERATION_RUNNING, S.VALIDATION_COMPLETE),
     (S.VALIDATION_COMPLETE, S.COMPLETED),
+    (S.ADAPTATION_PLANNED, S.DETERMINISTIC_TRANSFORM_COMPLETE),
+    (S.DETERMINISTIC_TRANSFORM_PENDING, S.VALIDATION_PENDING),
+]
+
+DETERMINISTIC_TRANSFORM_HAPPY_PATH = [
+    (S.ADAPTATION_PLANNED, S.DETERMINISTIC_TRANSFORM_PENDING),
+    (S.DETERMINISTIC_TRANSFORM_PENDING, S.DETERMINISTIC_TRANSFORM_COMPLETE),
+    (S.DETERMINISTIC_TRANSFORM_COMPLETE, S.VALIDATION_PENDING),
+]
+
+DETERMINISTIC_TRANSFORM_FAILURE_PATH = [
+    (S.DETERMINISTIC_TRANSFORM_PENDING, S.DETERMINISTIC_TRANSFORM_FAILED),
+    (S.DETERMINISTIC_TRANSFORM_FAILED, S.FAILED),
 ]
 
 TERMINAL = [S.COMPLETED, S.FAILED, S.CANCELLED]
@@ -59,6 +72,16 @@ def test_happy_path_transitions_allowed(from_state, to_state):
 @pytest.mark.parametrize("from_state,to_state", ILLEGAL_SKIPS)
 def test_illegal_skipped_transitions_rejected(from_state, to_state):
     assert can_transition(from_state, to_state) is False
+
+
+@pytest.mark.parametrize("from_state,to_state", DETERMINISTIC_TRANSFORM_HAPPY_PATH)
+def test_deterministic_transform_happy_path_allowed(from_state, to_state):
+    assert can_transition(from_state, to_state) is True
+
+
+@pytest.mark.parametrize("from_state,to_state", DETERMINISTIC_TRANSFORM_FAILURE_PATH)
+def test_deterministic_transform_failure_path_allowed(from_state, to_state):
+    assert can_transition(from_state, to_state) is True
 
 
 @pytest.mark.parametrize("state", TERMINAL)
@@ -82,6 +105,18 @@ def test_generation_failed_is_failure_and_retryable():
 def test_validation_failed_is_failure_and_retryable():
     assert is_failure_state(S.VALIDATION_FAILED) is True
     assert is_retryable_state(S.VALIDATION_FAILED) is True
+
+
+def test_deterministic_transform_failed_is_failure_and_retryable():
+    assert is_failure_state(S.DETERMINISTIC_TRANSFORM_FAILED) is True
+    assert is_retryable_state(S.DETERMINISTIC_TRANSFORM_FAILED) is True
+
+
+def test_deterministic_transform_pending_and_complete_are_not_terminal_or_review():
+    assert is_terminal_state(S.DETERMINISTIC_TRANSFORM_PENDING) is False
+    assert is_terminal_state(S.DETERMINISTIC_TRANSFORM_COMPLETE) is False
+    assert is_human_review_state(S.DETERMINISTIC_TRANSFORM_PENDING) is False
+    assert is_human_review_state(S.DETERMINISTIC_TRANSFORM_COMPLETE) is False
 
 
 def test_terminal_failed_is_failure_but_not_retryable():

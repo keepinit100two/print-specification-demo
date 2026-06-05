@@ -35,7 +35,7 @@ from app.services import print_orchestrator
 from app.services.print_normalization import normalize_submission
 from app.services.print_specification import resolve_specification
 from app.services.print_compliance import evaluate_compliance
-from app.services.print_approval import create_approval_package
+from app.services.print_approval import create_approval_package, record_approval_decision
 from app.services.print_prompt_construction import build_generation_request
 from app.services.print_orchestrator import advance_workflow
 
@@ -1817,3 +1817,145 @@ def test_approval_decision_wiring_exception_path(monkeypatch):
     assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
     assert result.subsystem_records[0].error_message
     assert result.run_result.approval is None
+
+
+# ---------------------------------------------------------------------------
+# Production packaging (Phase 10) — expected to fail until the spine calls
+# create_production_package from APPROVED.
+#
+# Assembles a ProductionPackage from an approved output; does not print, ship,
+# or complete the workflow.
+#
+# Legal success transitions:
+#   APPROVED -> PRODUCTION_PACKAGING_PENDING -> PRODUCTION_PACKAGE_CREATED
+# ---------------------------------------------------------------------------
+
+
+def _approved_run_result(
+    *,
+    include_approval=True,
+    include_validation=True,
+    include_specification=True,
+    include_candidates=True,
+    include_selected_output=True,
+):
+    """Build an APPROVED run bundle ready for production packaging."""
+    run_result, spec, candidate, package = _owner_review_pending_run_result()
+
+    if not include_specification:
+        run_result.specification = None
+
+    if not include_validation:
+        run_result.validation = None
+
+    if not include_candidates:
+        run_result.candidates = []
+    elif not include_selected_output:
+        run_result.candidates = []
+
+    if include_approval and package is not None and candidate is not None:
+        run_result.approval = record_approval_decision(
+            package,
+            candidate.candidate_id,
+            ApprovalStatus.APPROVED,
+            "owner@example.com",
+        )
+    else:
+        run_result.approval = None
+
+    run_result.state = S.APPROVED
+    run_result.stage = PrintWorkflowStage.APPROVAL
+    run_result.status = ResultStatus.PASSED
+    return run_result, spec, candidate
+
+
+def test_production_packaging_wiring_approved_creates_package():
+    run_result, spec, candidate = _approved_run_result()
+    request = _request(
+        S.APPROVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.PRODUCTION_PACKAGE_CREATED
+    assert result.current_state != S.COMPLETED
+    assert result.run_result.production_package is not None
+    assert result.run_result.production_package.spec_id == spec.spec_id
+    assert result.run_result.production_package.candidate_id == candidate.candidate_id
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ProductionPackagingService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.APPROVED, S.PRODUCTION_PACKAGING_PENDING) in pairs
+    assert (S.PRODUCTION_PACKAGING_PENDING, S.PRODUCTION_PACKAGE_CREATED) in pairs
+
+
+def test_production_packaging_wiring_missing_approval_fails_safely():
+    run_result, spec, candidate = _approved_run_result(include_approval=False)
+    request = _request(
+        S.APPROVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ProductionPackagingService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.production_package is None
+
+
+def test_production_packaging_wiring_missing_selected_output_fails_safely():
+    run_result, spec, candidate = _approved_run_result(include_selected_output=False)
+    request = _request(
+        S.APPROVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ProductionPackagingService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.production_package is None
+
+
+def test_production_packaging_wiring_exception_path(monkeypatch):
+    def _boom(approval_decision, specification, validation_result, output_asset):
+        raise RuntimeError("production packaging exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator,
+        "create_production_package",
+        _boom,
+        raising=False,
+    )
+
+    run_result, spec, candidate = _approved_run_result()
+    request = _request(
+        S.APPROVED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ProductionPackagingService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.production_package is None

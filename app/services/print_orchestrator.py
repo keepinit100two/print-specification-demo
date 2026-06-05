@@ -37,6 +37,7 @@ from app.domain.print_schemas import (
     ModelInvocationRecord,
     NormalizationResult,
     PrintSpecification,
+    ProductionPackage,
     PrintWorkflowRunResult,
     PrintWorkflowStage,
     PrintWorkflowState,
@@ -57,6 +58,7 @@ from app.services.print_compliance import evaluate_compliance
 from app.services.print_deterministic_transform import execute_deterministic_transforms
 from app.services.print_generation import generate_candidates
 from app.services.print_normalization import normalize_submission
+from app.services.print_production_packaging import create_production_package
 from app.services.print_prompt_construction import build_generation_request
 from app.services.print_specification import resolve_specification
 from app.services.print_validation import validate_print_asset
@@ -173,6 +175,7 @@ def _result(
     validation: Optional[ValidationResult] = None,
     approval_package: Optional[ApprovalPackage] = None,
     approval: Optional[ApprovalDecision] = None,
+    production_package: Optional[ProductionPackage] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
@@ -196,6 +199,8 @@ def _result(
         run_result.approval_package = approval_package
     if approval is not None:
         run_result.approval = approval
+    if production_package is not None:
+        run_result.production_package = production_package
 
     # `transition_checks` is the source of truth for all movements in this step.
     # `transition_check` mirrors the final movement for backward compatibility.
@@ -1748,6 +1753,186 @@ def _advance_approval_decision(
     )
 
 
+def _packaging_output_id(asset: GeneratedCandidate | TransformedAsset) -> str:
+    """Return the stable output id for a generated or transformed asset."""
+    if isinstance(asset, GeneratedCandidate):
+        return asset.candidate_id
+    return asset.transformed_asset_id
+
+
+def _iter_packaging_outputs(run: PrintWorkflowRunResult):
+    """Yield generated and deterministically transformed outputs from a run bundle."""
+    for candidate in run.candidates or []:
+        yield candidate
+    deterministic_transform = getattr(run, "deterministic_transform", None)
+    if deterministic_transform is not None:
+        for asset in getattr(deterministic_transform, "transformed_assets", None) or []:
+            yield asset
+
+
+def _resolve_approved_output_asset(
+    run: PrintWorkflowRunResult,
+    approved_output_id: str | None,
+) -> GeneratedCandidate | TransformedAsset | None:
+    """Find the approved output asset by id in candidates or transformed assets."""
+    if not approved_output_id:
+        return None
+    for asset in _iter_packaging_outputs(run):
+        if _packaging_output_id(asset) == approved_output_id:
+            return asset
+    return None
+
+
+def _packaging_macro_checks(
+    target_state: PrintWorkflowState,
+) -> List[TransitionCheckResult]:
+    """Record APPROVED -> PRODUCTION_PACKAGING_PENDING -> target."""
+    return [
+        _check(S.APPROVED, S.PRODUCTION_PACKAGING_PENDING),
+        _check(S.PRODUCTION_PACKAGING_PENDING, target_state),
+    ]
+
+
+def _packaging_failed(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+) -> WorkflowAdvanceResult:
+    """Build a terminal FAILED result for production packaging failures."""
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=S.FAILED,
+        status=ResultStatus.FAILED,
+        stopped=True,
+        transition_checks=_packaging_macro_checks(S.FAILED),
+        stop_reason="Production packaging failed",
+        next_steps="Investigate the production packaging failure and retry.",
+        reasons=[StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+    )
+
+
+def _advance_production_packaging(
+    request: WorkflowAdvanceRequest,
+) -> WorkflowAdvanceResult:
+    """
+    Phase 10 wiring: assemble a ProductionPackage from an approved output.
+
+    The spine only invokes create_production_package — it does not print, ship,
+    call AI, or perform file I/O.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    approval = run.approval if run is not None else None
+    specification = run.specification if run is not None else None
+    validation = run.validation if run is not None else None
+    approved_output_id = approval.candidate_id if approval is not None else None
+    output_asset = (
+        _resolve_approved_output_asset(run, approved_output_id)
+        if run is not None
+        else None
+    )
+
+    input_ids = [
+        cid
+        for cid in (
+            getattr(approval, "decision_id", None),
+            getattr(specification, "spec_id", None),
+            getattr(validation, "spec_id", None),
+            approved_output_id,
+        )
+        if cid
+    ]
+
+    started_at = datetime.utcnow()
+
+    if (
+        run is None
+        or approval is None
+        or specification is None
+        or validation is None
+        or output_asset is None
+    ):
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="ProductionPackagingService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_PACKAGING_INPUTS",
+            error_message=(
+                "Missing required inputs for production packaging (existing_run_result, "
+                "approval, specification, validation, or approved output asset)"
+            ),
+        )
+        return _packaging_failed(
+            request,
+            record=record,
+            error_code="MISSING_PACKAGING_INPUTS",
+            error_message=record.error_message,
+        )
+
+    try:
+        package = create_production_package(
+            approval,
+            specification,
+            validation,
+            output_asset,
+        )
+    except Exception as exc:
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Production packaging raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="ProductionPackagingService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="PACKAGING_EXCEPTION",
+            error_message=message,
+        )
+        return _packaging_failed(
+            request,
+            record=record,
+            error_code="PACKAGING_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = [package.package_id] if package.package_id else []
+    record = SubsystemExecutionRecord(
+        subsystem_name="ProductionPackagingService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    target = S.PRODUCTION_PACKAGE_CREATED
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=ResultStatus.PENDING,
+        stopped=False,
+        transition_checks=_packaging_macro_checks(target),
+        subsystem_records=[record],
+        production_package=package,
+        next_steps="Production package assembled; advance to completion when ready.",
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -1857,6 +2042,11 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     # for owner review.
     if current == S.VALIDATION_COMPLETE and request.requested_target_state is None:
         return _advance_approval(request)
+
+    # Phase 10: production packaging. When asked to advance from APPROVED with
+    # no explicit target, assemble a ProductionPackage from the approved output.
+    if current == S.APPROVED and request.requested_target_state is None:
+        return _advance_production_packaging(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

@@ -39,6 +39,8 @@ from app.domain.print_schemas import (
     PrintWorkflowState,
     ResultStatus,
     StageIssue,
+    TransformedAsset,
+    ValidationResult,
 )
 from app.domain.print_state_machine import (
     can_transition,
@@ -53,6 +55,7 @@ from app.services.print_generation import generate_candidates
 from app.services.print_normalization import normalize_submission
 from app.services.print_prompt_construction import build_generation_request
 from app.services.print_specification import resolve_specification
+from app.services.print_validation import validate_print_asset
 
 S = PrintWorkflowState
 
@@ -163,6 +166,7 @@ def _result(
     generation_request: Optional[GenerationRequest] = None,
     candidates: Optional[List[GeneratedCandidate]] = None,
     model_invocations: Optional[List[ModelInvocationRecord]] = None,
+    validation: Optional[ValidationResult] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
@@ -180,6 +184,8 @@ def _result(
         run_result.candidates = candidates
     if model_invocations is not None:
         run_result.model_invocations = model_invocations
+    if validation is not None:
+        run_result.validation = validation
 
     # `transition_checks` is the source of truth for all movements in this step.
     # `transition_check` mirrors the final movement for backward compatibility.
@@ -1211,6 +1217,205 @@ def _advance_deterministic_transform(
     )
 
 
+def _validation_macro_checks(
+    source_state: PrintWorkflowState,
+    target_state: PrintWorkflowState,
+) -> List[TransitionCheckResult]:
+    """Record source_state -> VALIDATION_PENDING -> target."""
+    return [
+        _check(source_state, S.VALIDATION_PENDING),
+        _check(S.VALIDATION_PENDING, target_state),
+    ]
+
+
+def _validation_output_id(asset: GeneratedCandidate | TransformedAsset) -> str:
+    """Return the stable output id used for validation subsystem records."""
+    if isinstance(asset, GeneratedCandidate):
+        return asset.candidate_id
+    return asset.transformed_asset_id
+
+
+def _resolve_validation_asset(
+    run: PrintWorkflowRunResult,
+    current_state: PrintWorkflowState,
+) -> GeneratedCandidate | TransformedAsset | None:
+    """
+    Select the output asset to validate for the current complete state.
+
+    GENERATION_COMPLETE uses the first candidate. DETERMINISTIC_TRANSFORM_COMPLETE
+    prefers deterministic_transform.transformed_assets when the run bundle carries
+    them; until that field exists, falls back to the first candidate placeholder
+    used by orchestration wiring tests.
+    """
+    if current_state == S.GENERATION_COMPLETE:
+        return run.candidates[0] if run.candidates else None
+
+    if current_state == S.DETERMINISTIC_TRANSFORM_COMPLETE:
+        deterministic_transform = getattr(run, "deterministic_transform", None)
+        if deterministic_transform is not None:
+            transformed_assets = getattr(deterministic_transform, "transformed_assets", None)
+            if transformed_assets:
+                return transformed_assets[0]
+        # Placeholder path until PrintWorkflowRunResult exposes deterministic output.
+        return run.candidates[0] if run.candidates else None
+
+    return None
+
+
+def _validation_failed(
+    request: WorkflowAdvanceRequest,
+    *,
+    source_state: PrintWorkflowState,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+    status: ResultStatus = ResultStatus.FAILED,
+    validation: Optional[ValidationResult] = None,
+    reasons: Optional[List[StageIssue]] = None,
+    next_steps: Optional[str] = None,
+    stop_reason: Optional[str] = None,
+) -> WorkflowAdvanceResult:
+    """Build a VALIDATION_FAILED result for missing inputs, review, failure, or exceptions."""
+    return _result(
+        request,
+        previous_state=source_state,
+        current_state=S.VALIDATION_FAILED,
+        status=status,
+        stopped=True,
+        transition_checks=_validation_macro_checks(source_state, S.VALIDATION_FAILED),
+        stop_reason=stop_reason or "Print validation failed",
+        next_steps=next_steps or "Investigate the validation failure and retry.",
+        reasons=reasons or [StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+        validation=validation,
+    )
+
+
+def _advance_validation(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 8 wiring: call the print validation service and route on its result.
+
+    The spine only invokes validate_print_asset — it does not inspect image
+    content, call AI, or perform file I/O.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    specification = run.specification if run is not None else None
+    asset = _resolve_validation_asset(run, current) if run is not None else None
+
+    input_ids = [
+        cid
+        for cid in (
+            getattr(specification, "spec_id", None),
+            _validation_output_id(asset) if asset is not None else None,
+        )
+        if cid
+    ]
+
+    started_at = datetime.utcnow()
+
+    if run is None or specification is None or asset is None:
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="PrintValidationService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_VALIDATION_INPUTS",
+            error_message=(
+                "Missing required inputs for validation (existing_run_result, "
+                "specification, or output asset)"
+            ),
+        )
+        return _validation_failed(
+            request,
+            source_state=current,
+            record=record,
+            error_code="MISSING_VALIDATION_INPUTS",
+            error_message=record.error_message,
+        )
+
+    try:
+        validation_result = validate_print_asset(specification, asset)
+    except Exception as exc:
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Print validation raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="PrintValidationService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="VALIDATION_EXCEPTION",
+            error_message=message,
+        )
+        return _validation_failed(
+            request,
+            source_state=current,
+            record=record,
+            error_code="VALIDATION_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = list(validation_result.validated_candidate_ids or [])
+    record = SubsystemExecutionRecord(
+        subsystem_name="PrintValidationService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    if validation_result.status == ResultStatus.PASSED:
+        target = S.VALIDATION_COMPLETE
+        return _result(
+            request,
+            previous_state=current,
+            current_state=target,
+            status=ResultStatus.PENDING,
+            stopped=False,
+            transition_checks=_validation_macro_checks(current, target),
+            subsystem_records=[record],
+            validation=validation_result,
+            next_steps=validation_result.next_steps,
+        )
+
+    if validation_result.status == ResultStatus.NEEDS_REVIEW:
+        return _validation_failed(
+            request,
+            source_state=current,
+            record=record,
+            error_code="VALIDATION_NEEDS_REVIEW",
+            error_message="Print validation requires human review",
+            status=ResultStatus.NEEDS_REVIEW,
+            validation=validation_result,
+            reasons=validation_result.reasons,
+            next_steps=validation_result.next_steps,
+            stop_reason="Print validation requires human review",
+        )
+
+    return _validation_failed(
+        request,
+        source_state=current,
+        record=record,
+        error_code="VALIDATION_FAILED",
+        error_message="Print validation did not pass",
+        status=ResultStatus.FAILED,
+        validation=validation_result,
+        reasons=validation_result.reasons,
+        next_steps=validation_result.next_steps,
+        stop_reason="Print validation did not pass",
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -1295,6 +1500,15 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
         and request.requested_target_state is None
     ):
         return _advance_deterministic_transform(request)
+
+    # Phase 8: validation wiring. When asked to advance from GENERATION_COMPLETE
+    # or DETERMINISTIC_TRANSFORM_COMPLETE with no explicit target, validate the
+    # output asset against the specification.
+    if (
+        current in (S.GENERATION_COMPLETE, S.DETERMINISTIC_TRANSFORM_COMPLETE)
+        and request.requested_target_state is None
+    ):
+        return _advance_validation(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

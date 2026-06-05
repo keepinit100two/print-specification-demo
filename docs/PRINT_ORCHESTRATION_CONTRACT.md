@@ -71,28 +71,100 @@ Every step returns a `PrintWorkflowRunResult`, surfacing:
 On a stop or failure, the result is **partial but valid**: produced stage outputs
 are present; unreached ones remain `None`/empty.
 
-## 5. Subsystem call sequence (happy path)
+## 5. Subsystem call sequence
+
+### Shared prefix (every run)
 
 ```
 RawSubmission
-  -> NormalizationService.normalize_submission        -> NormalizationResult (DesignJob)
+  -> NormalizationService.normalize_submission           -> NormalizationResult (DesignJob)
   -> SpecificationResolutionService.resolve_specification -> PrintSpecification
-  -> TechnicalComplianceService.evaluate_compliance   -> ComplianceResult
-  -> AdaptationPlanningService.create_adaptation_plan -> AdaptationPlan
-  -> PromptConstructionService.build_generation_request -> GenerationRequest
-  -> AIGenerationService.generate_candidates          -> GeneratedCandidate + ModelInvocationRecord
-  -> OutputValidationService.validate_candidates      -> ValidationResult
-  -> ApprovalWorkflowService.create_approval_package  -> ApprovalPackage
+  -> TechnicalComplianceService.evaluate_compliance      -> ComplianceResult
+  -> AdaptationPlanningService.create_adaptation_plan    -> AdaptationPlan
+```
+
+When assets are already print-ready at compliance, adaptation may be skipped
+(print-ready shortcut — future packaging path).
+
+### Deterministic branch (no AI)
+
+When the plan is satisfied by supported deterministic steps only:
+
+```
+  -> DeterministicTransformService.execute_deterministic_transforms
+        -> DeterministicTransformResult / TransformedAsset
+  -> [VALIDATION_PENDING]
+  -> PrintValidationService.validate_print_asset         -> ValidationResult
+```
+
+**State path:**
+
+`ADAPTATION_PLANNED → DETERMINISTIC_TRANSFORM_PENDING → DETERMINISTIC_TRANSFORM_COMPLETE → VALIDATION_PENDING → VALIDATION_COMPLETE`
+
+### AI branch (generation actuator)
+
+When `AdaptationPlan.requires_generation` is true:
+
+```
+  -> PromptConstructionService.build_generation_request  -> GenerationRequest
+  -> AIGenerationService.generate_candidates             -> GeneratedCandidate + ModelInvocationRecord
+  -> [VALIDATION_PENDING]
+  -> PrintValidationService.validate_print_asset          -> ValidationResult
+```
+
+**State path:**
+
+`ADAPTATION_PLANNED → GENERATION_PENDING → GENERATION_RUNNING → GENERATION_COMPLETE → VALIDATION_PENDING → VALIDATION_COMPLETE`
+
+Generation runs in **fake** mode by default (`PRINT_GENERATION_MODE=fake`) for
+tests and offline work. **OpenAI** mode delegates to `openai_image_client` and may
+persist bytes via `generated_artifact_store` under `artifacts/generated/`.
+
+### Post-validation (not yet wired)
+
+```
+  -> ApprovalWorkflowService.create_approval_package     -> ApprovalPackage
   -> [STOP: owner_review_pending — human decides]
-  -> ApprovalWorkflowService.record_approval_decision -> ApprovalDecision
+  -> ApprovalWorkflowService.record_approval_decision  -> ApprovalDecision
   -> ProductionPackagingService.create_production_package -> ProductionPackage
   -> completed
 ```
 
-The spine performs the corresponding legal transition before/after each call and
-records an audit event for each. (Per the state machine, `compliance_complete`
-may skip adaptation/generation and go straight to `production_packaging_pending`
-when assets are already print-ready.)
+The spine performs the corresponding legal transition before/after each call.
+Macro steps (generation, validation) record intermediate `*_PENDING` /
+`*_RUNNING` transitions in `transition_checks`.
+
+### Output contracts: GeneratedCandidate vs TransformedAsset
+
+| Output | Subsystem | Used on branch |
+| --- | --- | --- |
+| `GeneratedCandidate` | AI Generation | AI branch only |
+| `TransformedAsset` | Deterministic Transform | Deterministic branch only |
+
+`ModelInvocationRecord` accompanies AI generation for observability (provider,
+model, latency, errors). It does not authorize workflow transitions.
+
+### Validation boundary
+
+`PrintValidationService.validate_print_asset` measures **print-readiness only**
+(Option A): pixel dimensions, DPI, file format, and color profile when both
+sides provide one. It does not approve, score creative quality, or replace human
+review. Orchestration wiring from `GENERATION_COMPLETE` and
+`DETERMINISTIC_TRANSFORM_COMPLETE` is defined by tests and pending spine
+integration.
+
+### Current spine wiring status
+
+| Phase | Entry state | Service | Status |
+| --- | --- | --- | --- |
+| 1 | `NORMALIZATION_PENDING` | Normalization | Wired |
+| 2 | `NORMALIZED` | Specification | Wired |
+| 3 | `SPECIFICATION_RESOLVED` | Compliance | Wired |
+| 4 | `COMPLIANCE_COMPLETE` | Adaptation | Wired |
+| 5 | `ADAPTATION_PLANNED` | Prompt construction | Wired (AI branch) |
+| 6 | `GENERATION_PENDING` | AI generation | Wired |
+| 7 | `DETERMINISTIC_TRANSFORM_PENDING` | Deterministic transform | Wired |
+| 8 | `GENERATION_COMPLETE` / `DETERMINISTIC_TRANSFORM_COMPLETE` | Validation | Service implemented; spine wiring pending |
 
 ## 6. Stop boundaries
 

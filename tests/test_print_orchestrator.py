@@ -1249,3 +1249,224 @@ def test_deterministic_transform_wiring_exception_path(monkeypatch):
     assert all(c.allowed for c in result.transition_checks)
     pairs = _transition_pairs(result)
     assert (S.DETERMINISTIC_TRANSFORM_PENDING, S.DETERMINISTIC_TRANSFORM_FAILED) in pairs
+
+
+# ---------------------------------------------------------------------------
+# Validation wiring (Phase 8) — expected to fail until the spine calls
+# validate_print_asset from GENERATION_COMPLETE or DETERMINISTIC_TRANSFORM_COMPLETE.
+#
+# Macro step records two transitions:
+#   <complete_state> -> VALIDATION_PENDING -> VALIDATION_COMPLETE / FAILED
+# ---------------------------------------------------------------------------
+
+
+def _valid_generated_candidate(spec, *, candidate_id=None, properties=None):
+    """Build a GeneratedCandidate with optional compliant ImageProperties."""
+    properties = properties if properties is not None else _compliant_image(spec)
+    candidate_id = candidate_id or f"candidate-{uuid.uuid4()}"
+    return GeneratedCandidate(
+        candidate_id=candidate_id,
+        request_id=f"genreq-{candidate_id}",
+        uri=f"artifact://generated/{candidate_id}.png",
+        properties=properties,
+    )
+
+
+def _generation_complete_run_result(
+    *,
+    compliant_candidate=True,
+    include_specification=True,
+    include_candidates=True,
+):
+    """Build a GENERATION_COMPLETE run bundle with spec and optional candidates."""
+    run_result, generation_request = _generation_pending_run_result()
+    spec = run_result.specification
+
+    if not include_specification:
+        run_result.specification = None
+
+    candidate = None
+    if include_candidates:
+        if compliant_candidate:
+            candidate = _valid_generated_candidate(spec)
+        else:
+            image = _compliant_image(spec)
+            image.dpi = spec.dimensions.min_dpi - 150
+            candidate = _valid_generated_candidate(spec, properties=image)
+        run_result.candidates = [candidate]
+    else:
+        run_result.candidates = []
+
+    run_result.state = S.GENERATION_COMPLETE
+    run_result.stage = PrintWorkflowStage.GENERATION
+    run_result.status = ResultStatus.PENDING
+    return run_result, spec, candidate
+
+
+def _deterministic_transform_complete_run_result():
+    """
+    Build a DETERMINISTIC_TRANSFORM_COMPLETE run bundle with a validatable output.
+
+    TODO: PrintWorkflowRunResult has no deterministic_transform field yet. Future
+    wiring should validate transformed_assets[0] from that result. Until the run
+    bundle carries deterministic output, attach a compliant GeneratedCandidate so
+    this entry-point test can exercise validation routing from
+    DETERMINISTIC_TRANSFORM_COMPLETE.
+    """
+    run_result, design_job, spec, adaptation = _deterministic_transform_pending_run_result()
+    run_result.state = S.DETERMINISTIC_TRANSFORM_COMPLETE
+    run_result.stage = PrintWorkflowStage.ADAPTATION
+    run_result.status = ResultStatus.PENDING
+    run_result.candidates = [_valid_generated_candidate(spec)]
+    return run_result, spec
+
+
+def test_validation_wiring_generation_passes():
+    run_result, spec, candidate = _generation_complete_run_result()
+    request = _request(
+        S.GENERATION_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.VALIDATION_COMPLETE
+    assert result.run_result.validation is not None
+    assert result.run_result.validation.status == ResultStatus.PASSED
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "PrintValidationService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.GENERATION_COMPLETE, S.VALIDATION_PENDING) in pairs
+    assert (S.VALIDATION_PENDING, S.VALIDATION_COMPLETE) in pairs
+
+
+def test_validation_wiring_deterministic_transform_passes():
+    run_result, spec = _deterministic_transform_complete_run_result()
+    request = _request(
+        S.DETERMINISTIC_TRANSFORM_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.VALIDATION_COMPLETE
+    assert result.run_result.validation is not None
+    assert result.run_result.validation.status == ResultStatus.PASSED
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "PrintValidationService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.DETERMINISTIC_TRANSFORM_COMPLETE, S.VALIDATION_PENDING) in pairs
+    assert (S.VALIDATION_PENDING, S.VALIDATION_COMPLETE) in pairs
+
+
+def test_validation_wiring_failed_candidate_stops():
+    run_result, spec, candidate = _generation_complete_run_result(
+        compliant_candidate=False
+    )
+    request = _request(
+        S.GENERATION_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.VALIDATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert result.run_result.validation is not None
+    assert result.run_result.validation.status == ResultStatus.FAILED
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "PrintValidationService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.GENERATION_COMPLETE, S.VALIDATION_PENDING) in pairs
+    assert (S.VALIDATION_PENDING, S.VALIDATION_FAILED) in pairs
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "existing_run_result",
+        "specification",
+        "candidates",
+    ],
+)
+def test_validation_wiring_missing_inputs_fail_safely(missing_field):
+    run_result, spec, candidate = _generation_complete_run_result()
+
+    if missing_field == "existing_run_result":
+        request = _request(
+            S.GENERATION_COMPLETE,
+            target=None,
+        )
+    elif missing_field == "specification":
+        run_result.specification = None
+        request = _request(
+            S.GENERATION_COMPLETE,
+            target=None,
+            existing_run_result=run_result,
+        )
+    else:
+        run_result.candidates = []
+        request = _request(
+            S.GENERATION_COMPLETE,
+            target=None,
+            existing_run_result=run_result,
+        )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.VALIDATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "PrintValidationService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.GENERATION_COMPLETE, S.VALIDATION_PENDING) in pairs
+    assert (S.VALIDATION_PENDING, S.VALIDATION_FAILED) in pairs
+
+
+def test_validation_wiring_exception_path(monkeypatch):
+    def _boom(specification, asset):
+        raise RuntimeError("validation exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator, "validate_print_asset", _boom, raising=False
+    )
+
+    run_result, spec, candidate = _generation_complete_run_result()
+    request = _request(
+        S.GENERATION_COMPLETE,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.VALIDATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "PrintValidationService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.GENERATION_COMPLETE, S.VALIDATION_PENDING) in pairs
+    assert (S.VALIDATION_PENDING, S.VALIDATION_FAILED) in pairs

@@ -1959,3 +1959,181 @@ def test_production_packaging_wiring_exception_path(monkeypatch):
     assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
     assert result.subsystem_records[0].error_message
     assert result.run_result.production_package is None
+
+
+# ---------------------------------------------------------------------------
+# Workflow completion (Phase 11) — expected to fail until the spine advances
+# from PRODUCTION_PACKAGE_CREATED to COMPLETED with no explicit target.
+#
+# Legal success transition:
+#   PRODUCTION_PACKAGE_CREATED -> COMPLETED
+# ---------------------------------------------------------------------------
+
+
+def _production_package_created_run_result():
+    """Build a PRODUCTION_PACKAGE_CREATED run bundle via approved packaging."""
+    run_result, spec, candidate = _approved_run_result()
+    packaging_result = advance_workflow(
+        _request(S.APPROVED, target=None, existing_run_result=run_result)
+    )
+    assert packaging_result.current_state == S.PRODUCTION_PACKAGE_CREATED
+    return packaging_result.run_result, spec, candidate
+
+
+def test_completion_wiring_production_package_created_advances_to_completed():
+    run_result, spec, candidate = _production_package_created_run_result()
+    request = _request(
+        S.PRODUCTION_PACKAGE_CREATED,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.COMPLETED
+    assert result.status == ResultStatus.PASSED
+    assert result.stopped is True
+    assert result.subsystem_records == []
+    assert result.transition_check is not None
+    assert result.transition_check.from_state == S.PRODUCTION_PACKAGE_CREATED
+    assert result.transition_check.to_state == S.COMPLETED
+    assert result.transition_check.allowed is True
+    assert result.run_result.state == S.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# End-to-end happy path smoke — expected to fail until completion routing is
+# wired. Exercises the full AI remediation branch without OpenAI, network, or
+# file I/O (generate_candidates is monkeypatched).
+# ---------------------------------------------------------------------------
+
+
+def _e2e_raw_submission():
+    """Realistic banner submission with measurable but non-print-ready metadata."""
+    submission = _raw_submission(requested_product="banner")
+    submission.assets[0].properties = ImageProperties(
+        width_px=1200,
+        height_px=600,
+        dpi=72,
+        file_format="pdf",
+        color_profile="srgb",
+    )
+    return submission
+
+
+def _compliant_stub_generation_outputs(generation_request, spec):
+    """Deterministic fake candidates with spec-compliant properties (no OpenAI)."""
+    candidate = GeneratedCandidate(
+        candidate_id=f"candidate-{generation_request.request_id}-001",
+        request_id=generation_request.request_id,
+        uri=f"artifact://generated/candidate-{generation_request.request_id}-001.png",
+        properties=_compliant_image(spec),
+    )
+    invocation = ModelInvocationRecord(
+        invocation_id=f"invocation-{generation_request.request_id}",
+        request_id=generation_request.request_id,
+        provider="local-fake",
+        model_name="deterministic-mvp-generator",
+        status=InvocationStatus.SUCCEEDED,
+        generated_candidate_ids=[candidate.candidate_id],
+    )
+    return [candidate], [invocation]
+
+
+def test_end_to_end_happy_path_smoke(monkeypatch):
+    submission = _e2e_raw_submission()
+    spec_holder: list = []
+
+    def _fake_generate(req):
+        return _compliant_stub_generation_outputs(req, spec_holder[0])
+
+    monkeypatch.setattr(
+        print_orchestrator, "generate_candidates", _fake_generate, raising=False
+    )
+
+    result = advance_workflow(
+        _request(S.NORMALIZATION_PENDING, target=None, raw_submission=submission)
+    )
+    assert result.current_state == S.NORMALIZED
+    run_result = result.run_result
+
+    result = advance_workflow(
+        _request(S.NORMALIZED, target=None, existing_run_result=run_result)
+    )
+    assert result.current_state == S.SPECIFICATION_RESOLVED
+    run_result = result.run_result
+    spec_holder.append(run_result.specification)
+
+    result = advance_workflow(
+        _request(S.SPECIFICATION_RESOLVED, target=None, existing_run_result=run_result)
+    )
+    assert result.current_state == S.COMPLIANCE_COMPLETE
+    run_result = result.run_result
+
+    result = advance_workflow(
+        _request(S.COMPLIANCE_COMPLETE, target=None, existing_run_result=run_result)
+    )
+    assert result.current_state == S.ADAPTATION_PLANNED
+    run_result = result.run_result
+
+    result = advance_workflow(
+        _request(S.ADAPTATION_PLANNED, target=None, existing_run_result=run_result)
+    )
+    assert result.current_state == S.GENERATION_PENDING
+    run_result = result.run_result
+
+    result = advance_workflow(
+        _request(S.GENERATION_PENDING, target=None, existing_run_result=run_result)
+    )
+    assert result.current_state == S.GENERATION_COMPLETE
+    run_result = result.run_result
+
+    result = advance_workflow(
+        _request(S.GENERATION_COMPLETE, target=None, existing_run_result=run_result)
+    )
+    assert result.current_state == S.VALIDATION_COMPLETE
+    run_result = result.run_result
+
+    result = advance_workflow(
+        _request(S.VALIDATION_COMPLETE, target=None, existing_run_result=run_result)
+    )
+    assert result.current_state == S.OWNER_REVIEW_PENDING
+    run_result = result.run_result
+
+    candidate_id = run_result.candidates[0].candidate_id
+    result = advance_workflow(
+        _request(
+            S.OWNER_REVIEW_PENDING,
+            target=None,
+            existing_run_result=run_result,
+            metadata=_approval_decision_metadata(
+                ApprovalStatus.APPROVED,
+                candidate_id,
+            ),
+        )
+    )
+    assert result.current_state == S.APPROVED
+    run_result = result.run_result
+
+    result = advance_workflow(
+        _request(S.APPROVED, target=None, existing_run_result=run_result)
+    )
+    assert result.current_state == S.PRODUCTION_PACKAGE_CREATED
+    run_result = result.run_result
+
+    result = advance_workflow(
+        _request(
+            S.PRODUCTION_PACKAGE_CREATED,
+            target=None,
+            existing_run_result=run_result,
+        )
+    )
+
+    assert result.current_state == S.COMPLETED
+    assert result.status == ResultStatus.PASSED
+    assert result.stopped is True
+    assert result.run_result.production_package is not None
+    assert result.run_result.approval is not None
+    assert result.run_result.approval.status == ApprovalStatus.APPROVED
+    assert result.run_result.validation is not None
+    assert result.run_result.validation.status == ResultStatus.PASSED

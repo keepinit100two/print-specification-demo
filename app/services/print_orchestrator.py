@@ -1933,6 +1933,26 @@ def _advance_production_packaging(
     )
 
 
+def _advance_completion(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 11 wiring: mark the run complete when a production package exists.
+
+    No subsystem calls, file I/O, AI, or additional production work.
+    """
+    current = request.current_state
+    target = S.COMPLETED
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=ResultStatus.PASSED,
+        stopped=True,
+        transition_checks=[_check(current, target)],
+        stop_reason="Workflow completed",
+        next_steps="Run has completed successfully.",
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -2047,6 +2067,11 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     # no explicit target, assemble a ProductionPackage from the approved output.
     if current == S.APPROVED and request.requested_target_state is None:
         return _advance_production_packaging(request)
+
+    # Phase 11: completion routing. When asked to advance from
+    # PRODUCTION_PACKAGE_CREATED with no explicit target, mark the run complete.
+    if current == S.PRODUCTION_PACKAGE_CREATED and request.requested_target_state is None:
+        return _advance_completion(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

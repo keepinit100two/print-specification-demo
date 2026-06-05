@@ -13,7 +13,10 @@ from app.domain.print_schemas import (
     AdaptationPlan,
     AssetRole,
     DesignJob,
+    GeneratedCandidate,
     ImageProperties,
+    InvocationStatus,
+    ModelInvocationRecord,
     NormalizationResult,
     PrintWorkflowRunResult,
     PrintWorkflowStage,
@@ -30,6 +33,7 @@ from app.services import print_orchestrator
 from app.services.print_normalization import normalize_submission
 from app.services.print_specification import resolve_specification
 from app.services.print_compliance import evaluate_compliance
+from app.services.print_prompt_construction import build_generation_request
 from app.services.print_orchestrator import advance_workflow
 
 S = PrintWorkflowState
@@ -880,3 +884,174 @@ def test_prompt_wiring_exception_path(monkeypatch):
     assert result.run_result.generation_request is None
 
     assert all(c.allowed for c in result.transition_checks)
+
+
+# ---------------------------------------------------------------------------
+# AI generation wiring (Phase 6) — expected to fail until the spine calls
+# generate_candidates from GENERATION_PENDING.
+#
+# Macro step records two transitions:
+#   GENERATION_PENDING -> GENERATION_RUNNING -> GENERATION_COMPLETE / FAILED
+# ---------------------------------------------------------------------------
+
+
+def _generation_pending_run_result(include_generation_request=True):
+    """Build a GENERATION_PENDING run bundle with an optional GenerationRequest."""
+    run_result, design_job, spec, adaptation = _adaptation_planned_run_result(
+        requires_generation=True
+    )
+    generation_request = (
+        build_generation_request(design_job, spec, adaptation)
+        if include_generation_request
+        else None
+    )
+    run_result.generation_request = generation_request
+    run_result.stage = PrintWorkflowStage.GENERATION
+    run_result.state = S.GENERATION_PENDING
+    run_result.status = ResultStatus.PENDING
+    return run_result, generation_request
+
+
+def _stub_generation_outputs(generation_request):
+    """Deterministic fake candidates + invocation (no OpenAI)."""
+    candidate = GeneratedCandidate(
+        candidate_id=f"candidate-{generation_request.request_id}-001",
+        request_id=generation_request.request_id,
+        uri=f"artifact://generated/candidate-{generation_request.request_id}-001.png",
+    )
+    invocation = ModelInvocationRecord(
+        invocation_id=f"invocation-{generation_request.request_id}",
+        request_id=generation_request.request_id,
+        provider="local-fake",
+        model_name="deterministic-mvp-generator",
+        status=InvocationStatus.SUCCEEDED,
+        generated_candidate_ids=[candidate.candidate_id],
+    )
+    return [candidate], [invocation]
+
+
+def test_generation_wiring_success_advances(monkeypatch):
+    run_result, generation_request = _generation_pending_run_result()
+
+    def _fake_generate(req):
+        return _stub_generation_outputs(req)
+
+    monkeypatch.setattr(
+        print_orchestrator, "generate_candidates", _fake_generate, raising=False
+    )
+
+    request = _request(
+        S.GENERATION_PENDING,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.GENERATION_COMPLETE
+    assert result.run_result.candidates
+    assert result.run_result.model_invocations
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "AIGenerationService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.GENERATION_PENDING, S.GENERATION_RUNNING) in pairs
+    assert (S.GENERATION_RUNNING, S.GENERATION_COMPLETE) in pairs
+
+
+def test_generation_wiring_missing_request_fails_safely():
+    run_result, _ = _generation_pending_run_result(include_generation_request=False)
+
+    request = _request(
+        S.GENERATION_PENDING,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.GENERATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.candidates == []
+    assert result.run_result.model_invocations == []
+
+    assert all(c.allowed for c in result.transition_checks)
+
+
+def test_generation_wiring_no_candidates_produced(monkeypatch):
+    run_result, generation_request = _generation_pending_run_result()
+
+    failed_invocation = ModelInvocationRecord(
+        invocation_id=f"invocation-{generation_request.request_id}",
+        request_id=generation_request.request_id,
+        provider="local-fake",
+        model_name="deterministic-mvp-generator",
+        status=InvocationStatus.FAILED,
+        generated_candidate_ids=[],
+        error_code="NO_CANDIDATES",
+        error_message="No candidates produced",
+    )
+
+    monkeypatch.setattr(
+        print_orchestrator,
+        "generate_candidates",
+        lambda _req: ([], [failed_invocation]),
+        raising=False,
+    )
+
+    request = _request(
+        S.GENERATION_PENDING,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.GENERATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert result.run_result.candidates == []
+    assert result.run_result.model_invocations
+    assert result.subsystem_records[0].error_message or result.next_steps
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.GENERATION_PENDING, S.GENERATION_RUNNING) in pairs
+    assert (S.GENERATION_RUNNING, S.GENERATION_FAILED) in pairs
+
+
+def test_generation_wiring_exception_path(monkeypatch):
+    def _boom(_generation_request):
+        raise RuntimeError("generation exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator, "generate_candidates", _boom, raising=False
+    )
+
+    run_result, _ = _generation_pending_run_result()
+    request = _request(
+        S.GENERATION_PENDING,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.GENERATION_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.candidates == []
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.GENERATION_PENDING, S.GENERATION_RUNNING) in pairs
+    assert (S.GENERATION_RUNNING, S.GENERATION_FAILED) in pairs

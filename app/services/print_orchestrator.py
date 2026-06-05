@@ -29,7 +29,9 @@ from app.domain.print_schemas import (
     AdaptationPlan,
     AssetRole,
     ComplianceResult,
+    GeneratedCandidate,
     GenerationRequest,
+    ModelInvocationRecord,
     NormalizationResult,
     PrintSpecification,
     PrintWorkflowRunResult,
@@ -46,6 +48,7 @@ from app.domain.print_state_machine import (
 )
 from app.services.print_adaptation import create_adaptation_plan
 from app.services.print_compliance import evaluate_compliance
+from app.services.print_generation import generate_candidates
 from app.services.print_normalization import normalize_submission
 from app.services.print_prompt_construction import build_generation_request
 from app.services.print_specification import resolve_specification
@@ -154,6 +157,8 @@ def _result(
     compliance: Optional[ComplianceResult] = None,
     adaptation: Optional[AdaptationPlan] = None,
     generation_request: Optional[GenerationRequest] = None,
+    candidates: Optional[List[GeneratedCandidate]] = None,
+    model_invocations: Optional[List[ModelInvocationRecord]] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
@@ -167,6 +172,10 @@ def _result(
         run_result.adaptation = adaptation
     if generation_request is not None:
         run_result.generation_request = generation_request
+    if candidates is not None:
+        run_result.candidates = candidates
+    if model_invocations is not None:
+        run_result.model_invocations = model_invocations
 
     # `transition_checks` is the source of truth for all movements in this step.
     # `transition_check` mirrors the final movement for backward compatibility.
@@ -876,6 +885,161 @@ def _advance_prompt(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     )
 
 
+def _generation_macro_checks(
+    current: PrintWorkflowState,
+    target: PrintWorkflowState,
+) -> List[TransitionCheckResult]:
+    """Record GENERATION_PENDING -> GENERATION_RUNNING -> target."""
+    return [
+        _check(current, S.GENERATION_RUNNING),
+        _check(S.GENERATION_RUNNING, target),
+    ]
+
+
+def _generation_failed(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+    candidates: Optional[List[GeneratedCandidate]] = None,
+    model_invocations: Optional[List[ModelInvocationRecord]] = None,
+    next_steps: Optional[str] = None,
+) -> WorkflowAdvanceResult:
+    """Build a GENERATION_FAILED result for missing inputs, empty output, or exceptions."""
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=S.GENERATION_FAILED,
+        status=ResultStatus.FAILED,
+        stopped=True,
+        transition_checks=_generation_macro_checks(current, S.GENERATION_FAILED),
+        stop_reason="AI generation failed",
+        next_steps=next_steps or "Investigate the generation failure and retry.",
+        reasons=[StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+        candidates=candidates if candidates is not None else [],
+        model_invocations=model_invocations if model_invocations is not None else [],
+    )
+
+
+def _advance_generation(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
+    """
+    Phase 6 wiring: call the AI generation actuator and route on its outputs.
+
+    The spine only invokes generate_candidates — it does not inspect candidate
+    image content or call model providers directly.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    generation_request = (
+        run.generation_request if run is not None else None
+    )
+
+    input_ids = (
+        [generation_request.request_id]
+        if generation_request is not None
+        and getattr(generation_request, "request_id", None)
+        else []
+    )
+
+    started_at = datetime.utcnow()
+
+    if run is None or generation_request is None:
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="AIGenerationService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_GENERATION_INPUTS",
+            error_message=(
+                "Missing required inputs for generation (existing_run_result or "
+                "generation_request)"
+            ),
+        )
+        return _generation_failed(
+            request,
+            record=record,
+            error_code="MISSING_GENERATION_INPUTS",
+            error_message=record.error_message,
+        )
+
+    try:
+        candidates, invocations = generate_candidates(generation_request)
+    except Exception as exc:
+        completed_at = datetime.utcnow()
+        message = str(exc) or "AI generation raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="AIGenerationService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="GENERATION_EXCEPTION",
+            error_message=message,
+        )
+        return _generation_failed(
+            request,
+            record=record,
+            error_code="GENERATION_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = [c.candidate_id for c in candidates] if candidates else []
+
+    if not candidates:
+        record = SubsystemExecutionRecord(
+            subsystem_name="AIGenerationService",
+            input_contract_ids=input_ids,
+            output_contract_ids=output_ids,
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="NO_CANDIDATES",
+            error_message="Generation produced no candidates",
+        )
+        return _generation_failed(
+            request,
+            record=record,
+            error_code="NO_CANDIDATES",
+            error_message=record.error_message,
+            model_invocations=invocations,
+            next_steps="Generation produced no candidates; review the request and retry.",
+        )
+
+    record = SubsystemExecutionRecord(
+        subsystem_name="AIGenerationService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    target = S.GENERATION_COMPLETE
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=ResultStatus.PENDING,
+        stopped=False,
+        transition_checks=_generation_macro_checks(current, target),
+        subsystem_records=[record],
+        candidates=candidates,
+        model_invocations=invocations,
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -946,6 +1110,11 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     # adaptation requires generation.
     if current == S.ADAPTATION_PLANNED and request.requested_target_state is None:
         return _advance_prompt(request)
+
+    # Phase 6: AI generation wiring. When asked to advance from GENERATION_PENDING
+    # with no explicit target, call the generation actuator.
+    if current == S.GENERATION_PENDING and request.requested_target_state is None:
+        return _advance_generation(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

@@ -27,6 +27,10 @@ from app.domain.print_schemas import (
     InvocationStatus,
     ModelInvocationRecord,
 )
+from app.services.generated_artifact_store import (
+    decode_base64_image,
+    save_generated_image,
+)
 from app.services.openai_image_client import generate_openai_images
 
 _FAKE_PROVIDER = "local-fake"
@@ -64,18 +68,18 @@ def _validate_generation_request(generation_request: GenerationRequest) -> int:
 
 def _openai_image_size(width_px: int, height_px: int) -> str:
     """
-    Map requested pixel dimensions to a supported OpenAI Images API size.
+    Map requested pixel dimensions to a gpt-image-1 supported size.
 
-    Exact print dimensions are often unsupported; use landscape/portrait/square
-    presets for MVP, otherwise fall back to 1024x1024.
+    Supported API sizes: 1024x1024, 1024x1536, 1536x1024 (and auto).
+    Exact print dimensions are often unsupported; aspect ratio selects the preset.
     """
     if width_px <= 0 or height_px <= 0:
         return _OPENAI_MVP_SIZE
     ratio = width_px / height_px
     if ratio > 1.2:
-        return "1792x1024"
+        return "1536x1024"
     if ratio < 0.8:
-        return "1024x1792"
+        return "1024x1536"
     return _OPENAI_MVP_SIZE
 
 
@@ -123,6 +127,45 @@ def _failed_openai_invocation(
     )
 
 
+def _openai_candidate_uri(
+    generation_request: GenerationRequest,
+    *,
+    candidate_id: str,
+    output,
+    metadata: Dict[str, Any],
+) -> str:
+    """
+    Resolve candidate URI for an OpenAI output.
+
+    When b64_json is present, decode and save to artifacts/generated/; on
+    success use the absolute file path. On missing b64 or save/decode failure,
+    fall back to the deterministic artifact:// URI without failing the call.
+    """
+    fallback_uri = _candidate_uri(candidate_id, generation_request.output_format)
+
+    if not output.b64_json:
+        metadata["artifact_saved"] = False
+        if output.url:
+            metadata["openai_image_url"] = output.url
+        return fallback_uri
+
+    metadata["b64_json_length"] = len(output.b64_json)
+    try:
+        image_bytes = decode_base64_image(output.b64_json)
+        saved_path = save_generated_image(
+            candidate_id=candidate_id,
+            output_format=generation_request.output_format,
+            image_bytes=image_bytes,
+        )
+        metadata["artifact_saved"] = True
+        metadata["artifact_path"] = saved_path
+        return saved_path
+    except Exception as exc:
+        metadata["artifact_saved"] = False
+        metadata["artifact_error"] = str(exc) or "failed to save generated artifact"
+        return fallback_uri
+
+
 def _candidates_from_provider_outputs(
     generation_request: GenerationRequest,
     provider_result,
@@ -144,16 +187,18 @@ def _candidates_from_provider_outputs(
             "openai_response_index": output.index,
             "has_b64_json": has_b64_json,
         }
-        if output.url and not has_b64_json:
-            metadata["openai_image_url"] = output.url
-        if has_b64_json and output.b64_json:
-            metadata["b64_json_length"] = len(output.b64_json)
+        uri = _openai_candidate_uri(
+            generation_request,
+            candidate_id=candidate_id,
+            output=output,
+            metadata=metadata,
+        )
 
         candidates.append(
             GeneratedCandidate(
                 candidate_id=candidate_id,
                 request_id=generation_request.request_id,
-                uri=_candidate_uri(candidate_id, generation_request.output_format),
+                uri=uri,
                 properties=ImageProperties(
                     width_px=generation_request.output_width_px,
                     height_px=generation_request.output_height_px,

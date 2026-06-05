@@ -12,8 +12,10 @@ adaptation -> generation -> validation -> approval -> production):
         -> PrintSpecification    (resolved downstream from DesignJob + config)
         -> ComplianceResult      (submitted-image readiness vs. PrintSpecification)
         -> AdaptationPlan        (deterministic transformation intent)
+        -> DeterministicTransformResult / TransformedAsset
+                                  (deterministic adaptation execution outputs)
         -> GenerationRequest     (strict, model-ready)
-        -> GeneratedCandidate    (model outputs)
+        -> GeneratedCandidate    (AI/model outputs — not deterministic transforms)
         -> ValidationResult      (gate before approval)
         -> ApprovalDecision      (human decision)
         -> ProductionPackage     (final approved output)
@@ -160,6 +162,16 @@ class TransformationType(str, Enum):
     DPI_ADJUSTMENT = "dpi_adjustment"
     COLOR_PROFILE_CONVERSION = "color_profile_conversion"
     BLEED_EXTENSION = "bleed_extension"
+
+
+class DeterministicTransformStatus(str, Enum):
+    """Outcome of applying one deterministic transformation to an asset."""
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    NEEDS_REVIEW = "needs_review"
 
 
 class ApprovalStatus(str, Enum):
@@ -563,6 +575,100 @@ class AdaptationPlan(BaseModel):
     next_steps: Optional[str] = Field(
         None,
         description="Human-readable guidance on what should happen next",
+    )
+    provenance: Optional[ContractProvenance] = Field(
+        None,
+        description="Lineage/provenance for this contract instance",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 5b: Deterministic adaptation execution (outputs, not AI generation)
+# ---------------------------------------------------------------------------
+
+
+class TransformedAsset(BaseModel):
+    """
+    An asset produced by deterministic adaptation processing.
+
+    This is separate from GeneratedCandidate, which represents AI/model outputs.
+    Use TransformedAsset when an AdaptationPlan step is executed without calling
+    a generative model (resize, DPI adjustment, format conversion, etc.).
+    """
+
+    transformed_asset_id: str = Field(
+        ..., description="Unique id for this deterministically transformed asset"
+    )
+    source_asset_id: Optional[str] = Field(
+        None,
+        description="Submitted asset this transform was derived from, if known",
+    )
+    job_id: str = Field(..., description="DesignJob this asset belongs to")
+    spec_id: str = Field(..., description="PrintSpecification the asset targets")
+    plan_id: str = Field(..., description="AdaptationPlan that produced this asset")
+    uri: str = Field(
+        ...,
+        description="Location/reference of the transformed asset (file path or URI)",
+    )
+    properties: Optional[ImageProperties] = Field(
+        None,
+        description="Observed properties of the transformed asset, if measured",
+    )
+    transformations_applied: List[TransformationStep] = Field(
+        default_factory=list,
+        description="Deterministic steps applied to produce this asset",
+    )
+    status: DeterministicTransformStatus = Field(
+        ...,
+        description="Outcome of the deterministic transform for this asset",
+    )
+    reasons: List[StageIssue] = Field(
+        default_factory=list,
+        description="Why this asset reached its status",
+    )
+    warnings: List[StageIssue] = Field(
+        default_factory=list,
+        description="Non-blocking concerns about this transformed asset",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Processor-specific metadata (paths, codecs, timings, etc.)",
+    )
+    provenance: Optional[ContractProvenance] = Field(
+        None,
+        description="Lineage/provenance for this contract instance",
+    )
+
+
+class DeterministicTransformResult(BaseModel):
+    """
+    Result of executing deterministic adaptation steps from an AdaptationPlan.
+
+    Bundles one or more TransformedAsset outputs. This path does not invoke AI
+    generation; when an AdaptationPlan requires synthesis, the workflow routes
+    to GenerationRequest / GeneratedCandidate instead.
+    """
+
+    result_id: str = Field(..., description="Unique id for this transform result")
+    job_id: str = Field(..., description="DesignJob these transforms apply to")
+    spec_id: str = Field(..., description="PrintSpecification targeted")
+    plan_id: str = Field(..., description="AdaptationPlan that was executed")
+    status: ResultStatus = Field(..., description="Overall deterministic transform outcome")
+    transformed_assets: List[TransformedAsset] = Field(
+        default_factory=list,
+        description="Assets produced by deterministic processing",
+    )
+    reasons: List[StageIssue] = Field(
+        default_factory=list,
+        description="Why the transform run reached this status",
+    )
+    warnings: List[StageIssue] = Field(
+        default_factory=list,
+        description="Non-blocking concerns from deterministic processing",
+    )
+    next_steps: Optional[str] = Field(
+        None,
+        description="Guidance, e.g. proceed to validation or route to AI generation",
     )
     provenance: Optional[ContractProvenance] = Field(
         None,

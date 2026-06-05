@@ -11,6 +11,7 @@ from app.domain.print_orchestration_schemas import (
 )
 from app.domain.print_schemas import (
     AdaptationPlan,
+    ApprovalStatus,
     AssetRole,
     DesignJob,
     GeneratedCandidate,
@@ -34,6 +35,7 @@ from app.services import print_orchestrator
 from app.services.print_normalization import normalize_submission
 from app.services.print_specification import resolve_specification
 from app.services.print_compliance import evaluate_compliance
+from app.services.print_approval import create_approval_package
 from app.services.print_prompt_construction import build_generation_request
 from app.services.print_orchestrator import advance_workflow
 
@@ -1603,3 +1605,215 @@ def test_approval_wiring_exception_path(monkeypatch):
     assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
     assert result.subsystem_records[0].error_message
     assert result.run_result.approval_package is None
+
+
+# ---------------------------------------------------------------------------
+# Approval decision handling (Phase 9b) — expected to fail until the spine
+# records human decisions from OWNER_REVIEW_PENDING.
+#
+# WorkflowAdvanceRequest has no dedicated approval-decision fields yet. These
+# tests pass decision context via request.metadata["approval_decision"]:
+#   { "status": <ApprovalStatus value>, "candidate_id": str, "approver": str }
+#
+# Future spine wiring should read that metadata (or a first-class request field)
+# when advancing from OWNER_REVIEW_PENDING with requested_target_state=None.
+# Do not record ApprovalDecision or create ProductionPackage in this phase.
+# ---------------------------------------------------------------------------
+
+
+def _approval_decision_metadata(
+    status: ApprovalStatus,
+    candidate_id: str,
+    approver: str = "owner@example.com",
+):
+    """Temporary decision payload until WorkflowAdvanceRequest gains typed fields."""
+    return {
+        "approval_decision": {
+            "status": status.value,
+            "candidate_id": candidate_id,
+            "approver": approver,
+        }
+    }
+
+
+def _owner_review_pending_run_result(*, include_approval_package=True):
+    """Build an OWNER_REVIEW_PENDING run bundle with optional approval_package."""
+    run_result, spec, candidate = _validation_complete_run_result()
+    design_job = run_result.normalization.design_job
+
+    if include_approval_package:
+        package = create_approval_package(
+            run_result.validation,
+            run_result.candidates,
+            spec,
+            design_job,
+        )
+        run_result.approval_package = package
+    else:
+        package = None
+        run_result.approval_package = None
+
+    run_result.state = S.OWNER_REVIEW_PENDING
+    run_result.stage = PrintWorkflowStage.APPROVAL
+    run_result.status = ResultStatus.NEEDS_REVIEW
+    return run_result, spec, candidate, package
+
+
+def test_approval_decision_wiring_approved_routes_to_approved():
+    run_result, spec, candidate, package = _owner_review_pending_run_result()
+    request = _request(
+        S.OWNER_REVIEW_PENDING,
+        target=None,
+        existing_run_result=run_result,
+        metadata=_approval_decision_metadata(
+            ApprovalStatus.APPROVED,
+            candidate.candidate_id,
+        ),
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.APPROVED
+    assert result.run_result.approval is not None
+    assert result.run_result.approval.status == ApprovalStatus.APPROVED
+    assert result.run_result.approval.candidate_id == candidate.candidate_id
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ApprovalDecisionService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.OWNER_REVIEW_PENDING, S.APPROVED) in pairs
+
+
+def test_approval_decision_wiring_rejected_routes_to_rejected():
+    run_result, spec, candidate, package = _owner_review_pending_run_result()
+    request = _request(
+        S.OWNER_REVIEW_PENDING,
+        target=None,
+        existing_run_result=run_result,
+        metadata=_approval_decision_metadata(
+            ApprovalStatus.REJECTED,
+            candidate.candidate_id,
+        ),
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.REJECTED
+    assert result.run_result.approval is not None
+    assert result.run_result.approval.status == ApprovalStatus.REJECTED
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ApprovalDecisionService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.OWNER_REVIEW_PENDING, S.REJECTED) in pairs
+
+
+def test_approval_decision_wiring_changes_requested_routes_to_revision_requested():
+    run_result, spec, candidate, package = _owner_review_pending_run_result()
+    request = _request(
+        S.OWNER_REVIEW_PENDING,
+        target=None,
+        existing_run_result=run_result,
+        metadata=_approval_decision_metadata(
+            ApprovalStatus.CHANGES_REQUESTED,
+            candidate.candidate_id,
+        ),
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.REVISION_REQUESTED
+    assert result.run_result.approval is not None
+    assert result.run_result.approval.status == ApprovalStatus.CHANGES_REQUESTED
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ApprovalDecisionService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.OWNER_REVIEW_PENDING, S.REVISION_REQUESTED) in pairs
+
+
+def test_approval_decision_wiring_missing_package_stays_needs_review():
+    run_result, spec, candidate, _ = _owner_review_pending_run_result(
+        include_approval_package=False
+    )
+    request = _request(
+        S.OWNER_REVIEW_PENDING,
+        target=None,
+        existing_run_result=run_result,
+        metadata=_approval_decision_metadata(
+            ApprovalStatus.APPROVED,
+            candidate.candidate_id,
+        ),
+    )
+
+    result = advance_workflow(request)
+
+    # OWNER_REVIEW_PENDING has no legal transition to FAILED; halt in review.
+    assert result.current_state == S.OWNER_REVIEW_PENDING
+    assert result.status == ResultStatus.NEEDS_REVIEW
+    assert result.stopped is True
+    assert result.next_steps is not None
+    assert result.run_result.approval is None
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ApprovalDecisionService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+
+
+def test_approval_decision_wiring_missing_decision_input_stays_needs_review():
+    run_result, spec, candidate, package = _owner_review_pending_run_result()
+    request = _request(
+        S.OWNER_REVIEW_PENDING,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.OWNER_REVIEW_PENDING
+    assert result.status == ResultStatus.NEEDS_REVIEW
+    assert result.stopped is True
+    assert result.next_steps is not None
+    assert result.run_result.approval is None
+    assert result.subsystem_records == []
+
+
+def test_approval_decision_wiring_exception_path(monkeypatch):
+    def _boom(approval_package, candidate_id, status, approver):
+        raise RuntimeError("approval decision exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator,
+        "record_approval_decision",
+        _boom,
+        raising=False,
+    )
+
+    run_result, spec, candidate, package = _owner_review_pending_run_result()
+    request = _request(
+        S.OWNER_REVIEW_PENDING,
+        target=None,
+        existing_run_result=run_result,
+        metadata=_approval_decision_metadata(
+            ApprovalStatus.APPROVED,
+            candidate.candidate_id,
+        ),
+    )
+
+    result = advance_workflow(request)
+
+    # FAILED is not a legal transition from OWNER_REVIEW_PENDING; stay in review.
+    assert result.current_state == S.OWNER_REVIEW_PENDING
+    assert result.status == ResultStatus.NEEDS_REVIEW
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "ApprovalDecisionService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+    assert result.run_result.approval is None

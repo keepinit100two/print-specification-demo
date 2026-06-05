@@ -27,7 +27,9 @@ from app.domain.print_orchestration_schemas import (
 )
 from app.domain.print_schemas import (
     AdaptationPlan,
+    ApprovalDecision,
     ApprovalPackage,
+    ApprovalStatus,
     AssetRole,
     ComplianceResult,
     GeneratedCandidate,
@@ -50,7 +52,7 @@ from app.domain.print_state_machine import (
     is_terminal_state,
 )
 from app.services.print_adaptation import create_adaptation_plan
-from app.services.print_approval import create_approval_package
+from app.services.print_approval import create_approval_package, record_approval_decision
 from app.services.print_compliance import evaluate_compliance
 from app.services.print_deterministic_transform import execute_deterministic_transforms
 from app.services.print_generation import generate_candidates
@@ -170,6 +172,7 @@ def _result(
     model_invocations: Optional[List[ModelInvocationRecord]] = None,
     validation: Optional[ValidationResult] = None,
     approval_package: Optional[ApprovalPackage] = None,
+    approval: Optional[ApprovalDecision] = None,
 ) -> WorkflowAdvanceResult:
     """Assemble a WorkflowAdvanceResult with a partial run bundle attached."""
     run_result = _build_partial_run_result(request, current_state)
@@ -191,6 +194,8 @@ def _result(
         run_result.validation = validation
     if approval_package is not None:
         run_result.approval_package = approval_package
+    if approval is not None:
+        run_result.approval = approval
 
     # `transition_checks` is the source of truth for all movements in this step.
     # `transition_check` mirrors the final movement for backward compatibility.
@@ -1557,6 +1562,192 @@ def _advance_approval(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     )
 
 
+def _approval_decision_metadata(
+    request: WorkflowAdvanceRequest,
+) -> Optional[dict]:
+    """Return approval decision metadata when present on the advance request."""
+    metadata = request.metadata or {}
+    decision = metadata.get("approval_decision")
+    if not isinstance(decision, dict):
+        return None
+    return decision
+
+
+def _parse_approval_status(raw_status: object) -> Optional[ApprovalStatus]:
+    """Parse an ApprovalStatus from request metadata."""
+    if raw_status is None:
+        return None
+    try:
+        return ApprovalStatus(str(raw_status))
+    except ValueError:
+        return None
+
+
+def _target_for_approval_status(status: ApprovalStatus) -> PrintWorkflowState:
+    """Map a human approval outcome to the next workflow state."""
+    if status == ApprovalStatus.APPROVED:
+        return S.APPROVED
+    if status == ApprovalStatus.REJECTED:
+        return S.REJECTED
+    if status == ApprovalStatus.CHANGES_REQUESTED:
+        return S.REVISION_REQUESTED
+    raise ValueError(f"Unsupported approval status: {status.value}")
+
+
+def _approval_decision_stay_in_review(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+) -> WorkflowAdvanceResult:
+    """Halt in OWNER_REVIEW_PENDING when decision handling cannot complete."""
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=current,
+        status=ResultStatus.NEEDS_REVIEW,
+        stopped=True,
+        stop_reason=f"Run is awaiting human action in state '{current.value}'",
+        next_steps=error_message,
+        reasons=[StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+    )
+
+
+def _advance_approval_decision(
+    request: WorkflowAdvanceRequest,
+) -> WorkflowAdvanceResult:
+    """
+    Phase 9b wiring: record a human approval decision from request metadata.
+
+    The spine only invokes record_approval_decision — it does not create
+    ProductionPackage, call AI, or perform file I/O.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    decision = _approval_decision_metadata(request) or {}
+    approval_package = run.approval_package if run is not None else None
+    candidate_id = decision.get("candidate_id")
+    approver = decision.get("approver")
+    parsed_status = _parse_approval_status(decision.get("status"))
+
+    input_ids = [
+        cid
+        for cid in (
+            getattr(approval_package, "package_id", None),
+            candidate_id if candidate_id else None,
+        )
+        if cid
+    ]
+
+    started_at = datetime.utcnow()
+
+    if (
+        run is None
+        or approval_package is None
+        or parsed_status is None
+        or not approver
+    ):
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="ApprovalDecisionService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_APPROVAL_DECISION_INPUTS",
+            error_message=(
+                "Missing required inputs for approval decision (existing_run_result, "
+                "approval_package, decision status, or approver)"
+            ),
+        )
+        return _approval_decision_stay_in_review(
+            request,
+            record=record,
+            error_code="MISSING_APPROVAL_DECISION_INPUTS",
+            error_message=record.error_message,
+        )
+
+    try:
+        target = _target_for_approval_status(parsed_status)
+    except ValueError as exc:
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Unsupported approval decision status"
+        record = SubsystemExecutionRecord(
+            subsystem_name="ApprovalDecisionService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="UNSUPPORTED_APPROVAL_STATUS",
+            error_message=message,
+        )
+        return _approval_decision_stay_in_review(
+            request,
+            record=record,
+            error_code="UNSUPPORTED_APPROVAL_STATUS",
+            error_message=message,
+        )
+
+    try:
+        approval = record_approval_decision(
+            approval_package,
+            candidate_id,
+            parsed_status,
+            approver,
+        )
+    except Exception as exc:
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Approval decision recording raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="ApprovalDecisionService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="APPROVAL_DECISION_EXCEPTION",
+            error_message=message,
+        )
+        return _approval_decision_stay_in_review(
+            request,
+            record=record,
+            error_code="APPROVAL_DECISION_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = [approval.decision_id] if approval.decision_id else []
+    record = SubsystemExecutionRecord(
+        subsystem_name="ApprovalDecisionService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=_run_status_for_state(target),
+        stopped=True,
+        transition_checks=[_check(current, target)],
+        subsystem_records=[record],
+        approval=approval,
+        next_steps=approval.next_steps,
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -1584,6 +1775,16 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
             stop_reason=f"Run is in terminal state '{current.value}'",
             next_steps="Run has ended; start a new run to do more work.",
         )
+
+    # Phase 9b: approval decision handling. When owner review supplies decision
+    # metadata, record the human outcome before the generic human-review stop.
+    if (
+        current == S.OWNER_REVIEW_PENDING
+        and request.requested_target_state is None
+        and request.metadata
+        and "approval_decision" in request.metadata
+    ):
+        return _advance_approval_decision(request)
 
     # 2. Human-review states: hand control back to a human.
     if is_human_review_state(current):

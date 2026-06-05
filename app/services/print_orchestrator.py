@@ -48,6 +48,7 @@ from app.domain.print_state_machine import (
 )
 from app.services.print_adaptation import create_adaptation_plan
 from app.services.print_compliance import evaluate_compliance
+from app.services.print_deterministic_transform import execute_deterministic_transforms
 from app.services.print_generation import generate_candidates
 from app.services.print_normalization import normalize_submission
 from app.services.print_prompt_construction import build_generation_request
@@ -71,6 +72,9 @@ _STATE_TO_STAGE = {
     S.COMPLIANCE_COMPLETE: PrintWorkflowStage.COMPLIANCE,
     S.COMPLIANCE_FAILED: PrintWorkflowStage.COMPLIANCE,
     S.ADAPTATION_PLANNED: PrintWorkflowStage.ADAPTATION,
+    S.DETERMINISTIC_TRANSFORM_PENDING: PrintWorkflowStage.ADAPTATION,
+    S.DETERMINISTIC_TRANSFORM_COMPLETE: PrintWorkflowStage.ADAPTATION,
+    S.DETERMINISTIC_TRANSFORM_FAILED: PrintWorkflowStage.ADAPTATION,
     S.GENERATION_PENDING: PrintWorkflowStage.GENERATION,
     S.GENERATION_RUNNING: PrintWorkflowStage.GENERATION,
     S.GENERATION_COMPLETE: PrintWorkflowStage.GENERATION,
@@ -1040,6 +1044,173 @@ def _advance_generation(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResul
     )
 
 
+def _deterministic_transform_failed(
+    request: WorkflowAdvanceRequest,
+    *,
+    record: SubsystemExecutionRecord,
+    error_code: str,
+    error_message: str,
+    status: ResultStatus = ResultStatus.FAILED,
+    reasons: Optional[List[StageIssue]] = None,
+    next_steps: Optional[str] = None,
+    stop_reason: Optional[str] = None,
+) -> WorkflowAdvanceResult:
+    """Build a DETERMINISTIC_TRANSFORM_FAILED result for missing inputs, review, or exceptions."""
+    current = request.current_state
+    return _result(
+        request,
+        previous_state=current,
+        current_state=S.DETERMINISTIC_TRANSFORM_FAILED,
+        status=status,
+        stopped=True,
+        transition_checks=[_check(current, S.DETERMINISTIC_TRANSFORM_FAILED)],
+        stop_reason=stop_reason or "Deterministic transform failed",
+        next_steps=next_steps or "Investigate the deterministic transform failure and retry.",
+        reasons=reasons or [StageIssue(code=error_code, message=error_message)],
+        subsystem_records=[record],
+    )
+
+
+def _advance_deterministic_transform(
+    request: WorkflowAdvanceRequest,
+) -> WorkflowAdvanceResult:
+    """
+    Phase 7 wiring: call the deterministic transform service and route on its result.
+
+    The spine only invokes execute_deterministic_transforms — it does not perform
+    image processing, inspect transformation contents, or call AI.
+    """
+    current = request.current_state
+    run = request.existing_run_result
+    design_job = (
+        run.normalization.design_job
+        if run is not None and run.normalization is not None
+        else None
+    )
+    specification = run.specification if run is not None else None
+    adaptation = run.adaptation if run is not None else None
+
+    input_ids = [
+        cid
+        for cid in (
+            getattr(design_job, "job_id", None),
+            getattr(specification, "spec_id", None),
+            getattr(adaptation, "plan_id", None),
+        )
+        if cid
+    ]
+
+    started_at = datetime.utcnow()
+
+    if (
+        run is None
+        or design_job is None
+        or specification is None
+        or adaptation is None
+    ):
+        completed_at = datetime.utcnow()
+        record = SubsystemExecutionRecord(
+            subsystem_name="DeterministicTransformService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="MISSING_DETERMINISTIC_TRANSFORM_INPUTS",
+            error_message=(
+                "Missing required inputs for deterministic transforms "
+                "(existing_run_result, design_job, specification, or adaptation)"
+            ),
+        )
+        return _deterministic_transform_failed(
+            request,
+            record=record,
+            error_code="MISSING_DETERMINISTIC_TRANSFORM_INPUTS",
+            error_message=record.error_message,
+        )
+
+    try:
+        transform_result = execute_deterministic_transforms(
+            design_job, specification, adaptation
+        )
+    except Exception as exc:
+        completed_at = datetime.utcnow()
+        message = str(exc) or "Deterministic transform raised an exception"
+        record = SubsystemExecutionRecord(
+            subsystem_name="DeterministicTransformService",
+            input_contract_ids=input_ids,
+            output_contract_ids=[],
+            status=SubsystemExecutionStatus.FAILED,
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_ms=_latency_ms(started_at, completed_at),
+            error_code="DETERMINISTIC_TRANSFORM_EXCEPTION",
+            error_message=message,
+        )
+        return _deterministic_transform_failed(
+            request,
+            record=record,
+            error_code="DETERMINISTIC_TRANSFORM_EXCEPTION",
+            error_message=message,
+        )
+
+    completed_at = datetime.utcnow()
+    output_ids = [transform_result.result_id] if transform_result.result_id else []
+    output_ids.extend(
+        asset.transformed_asset_id
+        for asset in transform_result.transformed_assets
+        if getattr(asset, "transformed_asset_id", None)
+    )
+
+    record = SubsystemExecutionRecord(
+        subsystem_name="DeterministicTransformService",
+        input_contract_ids=input_ids,
+        output_contract_ids=output_ids,
+        status=SubsystemExecutionStatus.SUCCEEDED,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=_latency_ms(started_at, completed_at),
+    )
+
+    if transform_result.status == ResultStatus.NEEDS_REVIEW:
+        return _deterministic_transform_failed(
+            request,
+            record=record,
+            error_code="DETERMINISTIC_TRANSFORM_NEEDS_REVIEW",
+            error_message="Deterministic transform requires human review",
+            status=ResultStatus.NEEDS_REVIEW,
+            reasons=transform_result.reasons,
+            next_steps=transform_result.next_steps,
+            stop_reason="Deterministic transform requires human review",
+        )
+
+    if transform_result.status not in (ResultStatus.PASSED, ResultStatus.SKIPPED):
+        return _deterministic_transform_failed(
+            request,
+            record=record,
+            error_code="DETERMINISTIC_TRANSFORM_FAILED",
+            error_message=(
+                f"Deterministic transform returned unexpected status: "
+                f"{transform_result.status.value}"
+            ),
+            reasons=transform_result.reasons,
+            next_steps=transform_result.next_steps,
+        )
+
+    target = S.DETERMINISTIC_TRANSFORM_COMPLETE
+    return _result(
+        request,
+        previous_state=current,
+        current_state=target,
+        status=_run_status_for_state(target),
+        stopped=False,
+        transition_checks=[_check(current, target)],
+        subsystem_records=[record],
+        next_steps=transform_result.next_steps,
+    )
+
+
 def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     """
     Advance a print workflow by one step (Phase 0 shell).
@@ -1115,6 +1286,15 @@ def advance_workflow(request: WorkflowAdvanceRequest) -> WorkflowAdvanceResult:
     # with no explicit target, call the generation actuator.
     if current == S.GENERATION_PENDING and request.requested_target_state is None:
         return _advance_generation(request)
+
+    # Phase 7: deterministic transform wiring. When asked to advance from
+    # DETERMINISTIC_TRANSFORM_PENDING with no explicit target, execute supported
+    # adaptation steps without AI.
+    if (
+        current == S.DETERMINISTIC_TRANSFORM_PENDING
+        and request.requested_target_state is None
+    ):
+        return _advance_deterministic_transform(request)
 
     allowed_transitions = sorted(
         get_allowed_transitions(current), key=lambda s: s.value

@@ -1055,3 +1055,197 @@ def test_generation_wiring_exception_path(monkeypatch):
     pairs = _transition_pairs(result)
     assert (S.GENERATION_PENDING, S.GENERATION_RUNNING) in pairs
     assert (S.GENERATION_RUNNING, S.GENERATION_FAILED) in pairs
+
+
+# ---------------------------------------------------------------------------
+# Deterministic transform wiring (Phase 7) — expected to fail until the spine
+# calls execute_deterministic_transforms from DETERMINISTIC_TRANSFORM_PENDING.
+#
+# The legal success transition is a single step:
+#   DETERMINISTIC_TRANSFORM_PENDING -> DETERMINISTIC_TRANSFORM_COMPLETE
+# Unsupported transform outcomes route to:
+#   DETERMINISTIC_TRANSFORM_PENDING -> DETERMINISTIC_TRANSFORM_FAILED
+#
+# TODO: PrintWorkflowRunResult does not yet expose `deterministic_transform`.
+# Once that field exists, assert result.run_result.deterministic_transform is
+# populated on success and carries the DeterministicTransformResult status.
+# ---------------------------------------------------------------------------
+
+
+def _deterministic_transform_pending_run_result(
+    *,
+    transformation=TransformationType.RESIZE,
+    include_design_job=True,
+    include_specification=True,
+    include_adaptation=True,
+):
+    """Build a DETERMINISTIC_TRANSFORM_PENDING run bundle with adaptation inputs."""
+    run_result, design_job, spec = _spec_resolved_run_result(
+        include_specification=include_specification,
+    )
+
+    if not include_design_job:
+        run_result.normalization = None
+
+    adaptation = None
+    if include_adaptation:
+        adaptation = AdaptationPlan(
+            plan_id=f"plan-{design_job.job_id}",
+            spec_id=spec.spec_id,
+            job_id=design_job.job_id,
+            status=ResultStatus.PASSED,
+            requires_generation=False,
+            steps=[
+                TransformationStep(
+                    transformation=transformation,
+                    target_asset_role=AssetRole.PRIMARY,
+                    parameters={"requirement": "width_px"},
+                    reason="Resolve width_px via deterministic resize",
+                )
+            ],
+        )
+
+    run_result.adaptation = adaptation
+    run_result.stage = PrintWorkflowStage.ADAPTATION
+    run_result.state = S.DETERMINISTIC_TRANSFORM_PENDING
+    run_result.status = ResultStatus.PENDING
+    return run_result, design_job, spec, adaptation
+
+
+def test_deterministic_transform_wiring_success_advances():
+    run_result, design_job, spec, adaptation = _deterministic_transform_pending_run_result(
+        transformation=TransformationType.RESIZE,
+    )
+    request = _request(
+        S.DETERMINISTIC_TRANSFORM_PENDING,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.DETERMINISTIC_TRANSFORM_COMPLETE
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "DeterministicTransformService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+
+    # TODO: assert result.run_result.deterministic_transform once the run bundle field exists.
+    if hasattr(result.run_result, "deterministic_transform"):
+        assert result.run_result.deterministic_transform is not None
+        assert result.run_result.deterministic_transform.status == ResultStatus.PASSED
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.DETERMINISTIC_TRANSFORM_PENDING, S.DETERMINISTIC_TRANSFORM_COMPLETE) in pairs
+
+
+def test_deterministic_transform_wiring_needs_review_stops():
+    run_result, design_job, spec, adaptation = _deterministic_transform_pending_run_result(
+        transformation=TransformationType.BACKGROUND_REMOVAL,
+    )
+    request = _request(
+        S.DETERMINISTIC_TRANSFORM_PENDING,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.DETERMINISTIC_TRANSFORM_FAILED
+    assert result.status in (ResultStatus.NEEDS_REVIEW, ResultStatus.FAILED)
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "DeterministicTransformService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.SUCCEEDED
+    assert result.reasons or result.next_steps
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.DETERMINISTIC_TRANSFORM_PENDING, S.DETERMINISTIC_TRANSFORM_FAILED) in pairs
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "existing_run_result",
+        "design_job",
+        "specification",
+        "adaptation",
+    ],
+)
+def test_deterministic_transform_wiring_missing_inputs_fail_safely(missing_field):
+    run_result, design_job, spec, adaptation = _deterministic_transform_pending_run_result()
+
+    if missing_field == "existing_run_result":
+        request = _request(
+            S.DETERMINISTIC_TRANSFORM_PENDING,
+            target=None,
+        )
+    elif missing_field == "design_job":
+        run_result.normalization = None
+        request = _request(
+            S.DETERMINISTIC_TRANSFORM_PENDING,
+            target=None,
+            existing_run_result=run_result,
+        )
+    elif missing_field == "specification":
+        run_result.specification = None
+        request = _request(
+            S.DETERMINISTIC_TRANSFORM_PENDING,
+            target=None,
+            existing_run_result=run_result,
+        )
+    else:
+        run_result.adaptation = None
+        request = _request(
+            S.DETERMINISTIC_TRANSFORM_PENDING,
+            target=None,
+            existing_run_result=run_result,
+        )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.DETERMINISTIC_TRANSFORM_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "DeterministicTransformService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.DETERMINISTIC_TRANSFORM_PENDING, S.DETERMINISTIC_TRANSFORM_FAILED) in pairs
+
+
+def test_deterministic_transform_wiring_exception_path(monkeypatch):
+    def _boom(design_job, specification, adaptation_plan):
+        raise RuntimeError("deterministic transform exploded")
+
+    monkeypatch.setattr(
+        print_orchestrator,
+        "execute_deterministic_transforms",
+        _boom,
+        raising=False,
+    )
+
+    run_result, design_job, spec, adaptation = _deterministic_transform_pending_run_result()
+    request = _request(
+        S.DETERMINISTIC_TRANSFORM_PENDING,
+        target=None,
+        existing_run_result=run_result,
+    )
+
+    result = advance_workflow(request)
+
+    assert result.current_state == S.DETERMINISTIC_TRANSFORM_FAILED
+    assert result.status == ResultStatus.FAILED
+    assert result.stopped is True
+    assert len(result.subsystem_records) == 1
+    assert result.subsystem_records[0].subsystem_name == "DeterministicTransformService"
+    assert result.subsystem_records[0].status == SubsystemExecutionStatus.FAILED
+    assert result.subsystem_records[0].error_message
+
+    assert all(c.allowed for c in result.transition_checks)
+    pairs = _transition_pairs(result)
+    assert (S.DETERMINISTIC_TRANSFORM_PENDING, S.DETERMINISTIC_TRANSFORM_FAILED) in pairs

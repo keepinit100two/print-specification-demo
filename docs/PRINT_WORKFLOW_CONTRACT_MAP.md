@@ -12,45 +12,88 @@ referenced here are defined in `app/domain/print_schemas.py`. This document maps
 - Every produced contract should carry `ContractProvenance` (`source_id`, `derived_from_ids`, `created_by_stage`, `config_version`).
 - The AI is an **actuator**, not a controller: it executes a `GenerationRequest` and records outcomes; it never decides routing.
 
-### Pipeline overview
+### End-to-end workflow (implemented)
 
 Every run follows the same spine through compliance and adaptation planning.
 After `AdaptationPlan` is produced, the workflow **forks** into one of two
-remediation paths:
+remediation paths, then **rejoins** at validation before approval and packaging.
 
 ```
-RawSubmission
-  -> NormalizationResult (DesignJob)
-  -> PrintSpecification
-  -> ComplianceResult
-  -> AdaptationPlan
-       |
-       +--[deterministic branch]--> DeterministicTransformResult / TransformedAsset
-       |         -> VALIDATION_PENDING
-       |
-       +--[AI branch]--> GenerationRequest
-                 -> GENERATION_RUNNING
-                 -> GeneratedCandidate + ModelInvocationRecord
-                 -> VALIDATION_PENDING
-       |
-       v
-  ValidationResult
-  -> ApprovalPackage -> ApprovalDecision
-  -> ProductionPackage
-  -> PrintWorkflowRunResult (bundles stage outputs)
+SUBMITTED
+    ↓
+NORMALIZATION          (NormalizationResult / DesignJob)
+    ↓
+SPECIFICATION          (PrintSpecification)
+    ↓
+COMPLIANCE             (ComplianceResult)
+    ↓
+ADAPTATION             (AdaptationPlan)
+    ├── DETERMINISTIC_TRANSFORM   → TransformedAsset / DeterministicTransformResult
+    └── AI_GENERATION             → GenerationRequest → GeneratedCandidate + ModelInvocationRecord
+    ↓
+VALIDATION             (ValidationResult)     ← single gate for both branches
+    ↓
+APPROVAL_PACKAGE       (ApprovalPackage)
+    ↓
+APPROVAL_DECISION      (ApprovalDecision)     ← human gate; spine stops at owner review
+    ↓
+PRODUCTION_PACKAGE     (ProductionPackage)
+    ↓
+COMPLETED
 ```
 
-**Deterministic branch** (no AI):
+Fine-grained `PrintWorkflowState` paths (orchestrated in `print_orchestrator.py`):
 
-`ADAPTATION_PLANNED -> DETERMINISTIC_TRANSFORM_PENDING -> DETERMINISTIC_TRANSFORM_COMPLETE -> VALIDATION_PENDING`
+| Phase | State path |
+| --- | --- |
+| Intake / normalization | `SUBMITTED → NORMALIZATION_PENDING → NORMALIZED` |
+| Specification | `NORMALIZED → SPECIFICATION_PENDING → SPECIFICATION_RESOLVED` |
+| Compliance | `SPECIFICATION_RESOLVED → COMPLIANCE_PENDING → COMPLIANCE_COMPLETE` |
+| Adaptation planning | `COMPLIANCE_COMPLETE → ADAPTATION_PLANNED` |
+| **Deterministic branch** | `ADAPTATION_PLANNED → DETERMINISTIC_TRANSFORM_PENDING → DETERMINISTIC_TRANSFORM_COMPLETE → VALIDATION_PENDING` |
+| **AI branch** | `ADAPTATION_PLANNED → GENERATION_PENDING → GENERATION_RUNNING → GENERATION_COMPLETE → VALIDATION_PENDING` |
+| Validation | `VALIDATION_PENDING → VALIDATION_COMPLETE` (or `VALIDATION_FAILED`) |
+| Approval package | `VALIDATION_COMPLETE → OWNER_REVIEW_PENDING` |
+| Approval decision | `OWNER_REVIEW_PENDING → APPROVED` (or `REJECTED` / `REVISION_REQUESTED`) |
+| Production packaging | `APPROVED → PRODUCTION_PACKAGING_PENDING → PRODUCTION_PACKAGE_CREATED` |
+| Completion | `PRODUCTION_PACKAGE_CREATED → COMPLETED` |
 
-**AI branch** (generation actuator):
+### Deterministic Transform path vs AI Generation path
 
-`ADAPTATION_PLANNED -> GENERATION_PENDING -> GENERATION_RUNNING -> GENERATION_COMPLETE -> VALIDATION_PENDING`
+**Deterministic Transform path** — used when `AdaptationPlan.requires_generation`
+is `False` and the plan contains supported deterministic steps (`RESIZE`,
+`DPI_ADJUSTMENT`, `PAD`, `CROP`, `COLOR_PROFILE_CONVERSION`). The
+`DeterministicTransformService` records intent and placeholder
+`TransformedAsset` outputs without calling a model or reading files from disk.
 
-The orchestrator chooses the branch from `AdaptationPlan.requires_generation` and
-the planned `TransformationStep` types. Deterministic execution and AI generation
-are separate subsystems with separate output contracts.
+**AI Generation path** — used when `AdaptationPlan.requires_generation` is
+`True` (e.g. the plan includes `UPSCALE`, `BACKGROUND_REMOVAL`, or other steps
+that cannot be satisfied deterministically in the MVP). The spine calls
+`PromptConstructionService` to build a strict `GenerationRequest`, then
+`AIGenerationService` executes it and returns `GeneratedCandidate` outputs plus
+`ModelInvocationRecord` audit data.
+
+**Why AI is not the default path**
+
+- Adaptation planning prefers **deterministic remediation** when compliance gaps
+  can be closed without synthesis. AI is selected only when the plan explicitly
+  requires generation.
+- When submitted assets are already print-ready at compliance, adaptation may be
+  skipped entirely (no transform, no generation).
+- AI is an **actuator**, not a controller: it never decides routing, validates
+  its own output, or approves candidates.
+- Default deployment uses **`PRINT_GENERATION_MODE=fake`** — deterministic local
+  generation for tests and offline demos with no network or API key.
+
+**Why validation is downstream of both branches**
+
+- Both branches produce **print outputs** (`GeneratedCandidate` or
+  `TransformedAsset`) that must be measured against the same `PrintSpecification`
+  before human approval.
+- A single `PrintValidationService` gate (Option A: print-readiness only) keeps
+  reviewers from seeing unmeasured assets regardless of how they were produced.
+- Validation does not judge creative quality, brand fit, or approval — it only
+  checks dimensions, DPI, format, and color profile when metadata is present.
 
 ### GeneratedCandidate vs TransformedAsset
 
@@ -98,6 +141,51 @@ returns candidates plus invocation records.
 **Manual smoke test:** `python scripts/demo_generate_image.py` builds a sample
 `GenerationRequest`, calls `generate_candidates()`, and prints candidate URIs
 and invocation metadata. Loads `.env` when `python-dotenv` is installed.
+
+---
+
+## Core contracts
+
+Primary stage outputs defined in `app/domain/print_schemas.py`:
+
+| Contract | Role |
+| --- | --- |
+| `NormalizationResult` | Wraps normalization outcome and optional `DesignJob` (typed intent — not production requirements). |
+| `PrintSpecification` | Resolved production requirements (dimensions, DPI, color, formats) from `DesignJob` + config. |
+| `ComplianceResult` | Measurement of submitted-image readiness against the spec (`is_print_ready`, `ComplianceFinding`s). |
+| `AdaptationPlan` | Ordered deterministic transformation intent plus `requires_generation` flag; no execution. |
+| `GenerationRequest` | Strict, spec-derived model-ready request (pixels, DPI, format, candidate count). |
+| `GeneratedCandidate` | AI branch output: one model-produced asset (`candidate_id`, `uri`, `ImageProperties`). |
+| `TransformedAsset` | Deterministic branch output: one non-AI transformed asset (`transformed_asset_id`, `uri`, optional properties). |
+| `ValidationResult` | Print-readiness verdict for one output asset against `PrintSpecification`. |
+| `ApprovalPackage` | Routes passed validation outputs to owner review (`candidate_ids`, validation reference). |
+| `ApprovalDecision` | Records human outcome (`APPROVED`, `REJECTED`, `CHANGES_REQUESTED`) with approver and rationale. |
+| `ProductionPackage` | Final approved bundle for the print shop (`output_uris`, `manifest`, traceable ids). |
+
+`PrintWorkflowRunResult` bundles all stage outputs for orchestration logs and
+debugging. `ModelInvocationRecord` accompanies AI generation for observability
+only.
+
+---
+
+## Subsystem responsibilities
+
+| Subsystem | Module | Produces | Must not |
+| --- | --- | --- | --- |
+| `NormalizationService` | `print_normalization.py` | `NormalizationResult` / `DesignJob` | Resolve `PrintSpecification` or production requirements |
+| `SpecificationResolutionService` | `print_specification.py` | `PrintSpecification` | Measure assets or re-derive design intent |
+| `TechnicalComplianceService` | `print_compliance.py` | `ComplianceResult` | Transform assets, plan adaptation, or call AI |
+| `AdaptationPlanningService` | `print_adaptation.py` | `AdaptationPlan` | Execute transforms or call models |
+| `PromptConstructionService` | `print_prompt_construction.py` | `GenerationRequest` | Call the model (AI branch only) |
+| `AIGenerationService` | `print_generation.py` | `GeneratedCandidate`, `ModelInvocationRecord` | Decide routing, validate, approve, or package |
+| `DeterministicTransformService` | `print_deterministic_transform.py` | `DeterministicTransformResult` / `TransformedAsset` | Call AI, perform real image I/O, or route workflow |
+| `PrintValidationService` | `print_validation.py` | `ValidationResult` | Approve, call AI, or perform file I/O |
+| `ApprovalWorkflowService` | `print_approval.py` (`create_approval_package`) | `ApprovalPackage` | Record decisions or create production packages |
+| `ApprovalDecisionService` | `print_approval.py` (`record_approval_decision`) | `ApprovalDecision` | Auto-approve or package for production |
+| `ProductionPackagingService` | `print_production_packaging.py` | `ProductionPackage` | Re-validate, print, ship, or call AI |
+| **Orchestration Spine** | `print_orchestrator.py` | `PrintWorkflowRunResult`, transitions | Perform any subsystem work directly |
+
+Typed interfaces: `app/services/print_interfaces.py`.
 
 ---
 
@@ -187,34 +275,53 @@ and invocation metadata. Loads `.env` when `python-dotenv` is installed.
 - **Id fields:** `validated_candidate_ids` / `passed_candidate_ids` currently hold validated **output** ids (AI `candidate_id` or deterministic `transformed_asset_id`) until a dedicated asset-id field is added.
 - **Future test candidates:** Low DPI -> `FAILED` with `min_dpi` finding; unsupported format -> `file_format` finding; compliant output -> `PASSED`.
 
-## 9. Approval Workflow
+## 9a. Approval Package Routing (`ApprovalWorkflowService`)
 
-- **Owns:** `ApprovalPackage`, `ApprovalDecision` (and `ApprovalStatus`).
-- **Consumes:** `ValidationResult` + passed `GeneratedCandidate`s.
-- **Produces:** `ApprovalPackage` (request-for-decision) and `ApprovalDecision` (recorded human outcome).
-- **Allowed state transitions:** `VALIDATION_COMPLETE -> OWNER_REVIEW_PENDING`; `OWNER_REVIEW_PENDING -> APPROVED`; `-> REJECTED`; `-> REVISION_REQUESTED`.
-- **Must not do:** Auto-approve, generate or transform assets, or build the production package. The decision is **human**; the subsystem only routes (`routed_to`) and records.
-- **Future test candidates:** `ApprovalPackage.candidate_ids` ⊆ validation pass set; `REVISION_REQUESTED` carries actionable `reasons`; `ApprovalDecision` records `approver` and `decided_at`.
+- **Owns:** `ApprovalPackage`.
+- **Consumes:** `ValidationResult` + passed outputs + `PrintSpecification` + `DesignJob`.
+- **Produces:** `ApprovalPackage` (request-for-decision).
+- **Allowed state transitions:** `VALIDATION_COMPLETE -> OWNER_REVIEW_PENDING`.
+- **Must not do:** Record `ApprovalDecision`, auto-approve, or create `ProductionPackage`.
+- **Orchestration:** Wired — Phase 9 in `print_orchestrator.py`.
+
+## 9b. Approval Decision Recording (`ApprovalDecisionService`)
+
+- **Owns:** `ApprovalDecision` (and `ApprovalStatus`).
+- **Consumes:** `ApprovalPackage` + human decision input (candidate, status, approver).
+- **Produces:** `ApprovalDecision`.
+- **Allowed state transitions:** `OWNER_REVIEW_PENDING -> APPROVED`; `-> REJECTED`; `-> REVISION_REQUESTED`.
+- **Must not do:** Auto-approve, generate or transform assets, or build the production package.
+- **Orchestration:** Wired — Phase 9b; decision context currently supplied via `WorkflowAdvanceRequest.metadata["approval_decision"]` (see Known MVP Tradeoffs).
+- **Future test candidates:** `ApprovalPackage.candidate_ids` ⊆ validation pass set; `CHANGES_REQUESTED` carries actionable `reasons`; `ApprovalDecision` records `approver` and `decided_at`.
 
 ## 10. Production Packaging
 
 - **Owns:** `ProductionPackage`.
-- **Consumes:** `ApprovalDecision` + approved `GeneratedCandidate` + `PrintSpecification`.
+- **Consumes:** `ApprovalDecision` + approved output (`GeneratedCandidate` or `TransformedAsset`) + `PrintSpecification` + `ValidationResult`.
 - **Produces:** `ProductionPackage`.
 - **Allowed state transitions:** `APPROVED -> PRODUCTION_PACKAGING_PENDING -> PRODUCTION_PACKAGE_CREATED`; `PRODUCTION_PACKAGE_CREATED -> COMPLETED`.
-- **Must not do:** Re-validate, re-generate, or alter the approved candidate. It assembles the final bundle (`output_uris`, `manifest`) for the print shop.
-- **Future test candidates:** Package only assembled when `ApprovalStatus.APPROVED`; `manifest` matches `PrintSpecification`; `candidate_id`/`decision_id` traceable.
+- **Must not do:** Re-validate, re-generate, print, ship, or alter the approved output. Assembles `output_uris` and `manifest` only.
+- **Orchestration:** Wired — Phase 10 in `print_orchestrator.py`.
 
-## 11. Orchestration Spine
+## 11. Workflow Completion (orchestration routing)
+
+- **Owns:** No new contract — marks an existing run complete.
+- **Consumes:** `PrintWorkflowRunResult` with `production_package` already populated.
+- **Produces:** Updated run state `COMPLETED`, `status=PASSED`.
+- **Allowed state transitions:** `PRODUCTION_PACKAGE_CREATED -> COMPLETED`.
+- **Must not do:** Call subsystems, perform file I/O, AI, printing, or shipping. Completion routing simply acknowledges the production package exists.
+- **Orchestration:** Wired — Phase 11 in `print_orchestrator.py`.
+
+## 12. Orchestration Spine
 
 - **Owns:** `PrintWorkflowRunResult`; the `PrintWorkflowStage`/`PrintWorkflowState` state machine.
 - **Consumes:** Stage outputs from every subsystem.
-- **Produces:** `PrintWorkflowRunResult` (bundles all stage outputs + `model_invocations` + `approval_package`).
+- **Produces:** `PrintWorkflowRunResult` (bundles all stage outputs + `model_invocations` + `approval_package` + `approval` + `production_package`).
 - **Allowed state transitions:** All transitions across the run, including terminal `-> CANCELLED` and `-> FAILED` from any stage.
 - **Must not do:** Perform subsystem work (no normalization, spec resolution, compliance, generation, validation, packaging logic). It **coordinates** transitions and aggregates results only.
 - **Future test candidates:** Illegal transitions rejected; `stage` and `state` stay consistent; failure in any stage drives `FAILED` with run-level `reasons`; partial runs serialize (optional stage outputs).
 
-## 12. Audit / Observation
+## 13. Audit / Observation
 
 - **Owns:** Nothing (no contracts).
 - **Consumes:** `PrintWorkflowRunResult`, `ModelInvocationRecord`, and `ContractProvenance` across contracts (read-only).
@@ -223,7 +330,7 @@ and invocation metadata. Loads `.env` when `python-dotenv` is installed.
 - **Must not do:** Mutate any contract, change state, or influence control flow. **Observe only.**
 - **Future test candidates:** Audit reconstructs lineage from `derived_from_ids`; observation never alters state; every state transition emits an event.
 
-## 13. Storage / Asset
+## 14. Storage / Asset
 
 - **Owns:** Nothing semantically (no domain contracts).
 - **Consumes:** Asset URIs referenced by `SubmittedAsset`, `GeneratedCandidate`, `TransformedAsset`, `ProductionPackage`.
@@ -233,7 +340,7 @@ and invocation metadata. Loads `.env` when `python-dotenv` is installed.
 - **Must not do:** Interpret, validate, or transform asset content; make routing decisions. **Store assets only.**
 - **Future test candidates:** URIs resolve to stored bytes; storage is idempotent per asset id; missing asset surfaces a clear error to the consuming subsystem (not a state change).
 
-## 14. Configuration
+## 15. Configuration
 
 - **Owns:** Rules/policy inputs (e.g. routing/spec config such as `configs/routing.json`); `config_version` semantics.
 - **Consumes:** Nothing at runtime.
@@ -259,9 +366,44 @@ and invocation metadata. Loads `.env` when `python-dotenv` is installed.
 | OpenAI client (provider boundary) | — (provider DTOs only) |
 | Generated artifact store | — (local files under `artifacts/generated/`) |
 | Output Validation | `ValidationResult` |
-| Approval Workflow | `ApprovalPackage`, `ApprovalDecision` |
+| Approval Workflow (`ApprovalWorkflowService`) | `ApprovalPackage` |
+| Approval Decision (`ApprovalDecisionService`) | `ApprovalDecision` |
 | Production Packaging | `ProductionPackage` |
 | Orchestration Spine | `PrintWorkflowRunResult`, state machine |
 | Audit / Observation | — (read-only) |
 | Storage / Asset | — (asset bytes/URIs) |
 | Configuration | rules/policy, `config_version` |
+
+---
+
+## Known MVP Tradeoffs
+
+Documented gaps that tests and orchestration account for but schemas have not
+yet closed:
+
+- **`validated_candidate_ids` naming** — `ValidationResult.validated_candidate_ids`
+  and `passed_candidate_ids` currently store validated **output** ids for both
+  AI candidates (`candidate_id`) and deterministic transforms
+  (`transformed_asset_id`). A dedicated asset-id field may be added later.
+- **Deterministic transform on run bundle** — `PrintWorkflowRunResult` does not
+  yet expose a `deterministic_transform` field. Orchestration validation and
+  production packaging can search `deterministic_transform.transformed_assets`
+  when present; until then, wiring tests use a compliant `GeneratedCandidate`
+  placeholder when advancing from `DETERMINISTIC_TRANSFORM_COMPLETE`.
+- **Approval decision input** — Human approval outcomes are passed via
+  `WorkflowAdvanceRequest.metadata["approval_decision"]`
+  (`status`, `candidate_id`, `approver`) rather than first-class typed fields
+  on `WorkflowAdvanceRequest`.
+- **No external email delivery** — Owner review is modeled as a workflow stop
+  (`OWNER_REVIEW_PENDING`); there is no email/notification subsystem yet.
+
+---
+
+## Workflow Completion Status
+
+| Item | Status |
+| --- | --- |
+| All workflow stages implemented | **Yes** — normalization through production packaging services exist and are unit-tested |
+| All workflow stages orchestrated | **Yes** — Phases 1–11 wired in `print_orchestrator.py` |
+| End-to-end happy path tested | **Yes** — `test_end_to_end_happy_path_smoke` exercises the full AI remediation branch through `COMPLETED` |
+| Test suite | **233 tests passing** (`pytest`) |

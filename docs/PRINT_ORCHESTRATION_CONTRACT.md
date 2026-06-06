@@ -8,6 +8,46 @@ References:
 - States/transitions: `app/domain/print_state_machine.py` (`PrintWorkflowState`, `LEGAL_TRANSITIONS`, helpers).
 - Stage labels & run bundle: `app/domain/print_schemas.py` (`PrintWorkflowStage`, `PrintWorkflowRunResult`).
 - Subsystem interfaces: `app/services/print_interfaces.py`.
+- Contract ownership: `docs/PRINT_WORKFLOW_CONTRACT_MAP.md`.
+
+---
+
+## 0. End-to-end workflow (orchestrated)
+
+```
+SUBMITTED
+    ↓  NormalizationService
+NORMALIZED
+    ↓  SpecificationResolutionService
+SPECIFICATION_RESOLVED
+    ↓  TechnicalComplianceService
+COMPLIANCE_COMPLETE
+    ↓  AdaptationPlanningService
+ADAPTATION_PLANNED
+    ├── DeterministicTransformService  → DETERMINISTIC_TRANSFORM_COMPLETE
+    └── PromptConstructionService + AIGenerationService → GENERATION_COMPLETE
+    ↓  PrintValidationService (both branches rejoin here)
+VALIDATION_COMPLETE
+    ↓  ApprovalWorkflowService
+OWNER_REVIEW_PENDING
+    ↓  ApprovalDecisionService (human metadata)
+APPROVED
+    ↓  ProductionPackagingService
+PRODUCTION_PACKAGE_CREATED
+    ↓  completion routing (no subsystem)
+COMPLETED
+```
+
+**Deterministic branch** — `requires_generation=False`; supported deterministic
+steps only. No AI, no `GenerationRequest`.
+
+**AI branch** — `requires_generation=True`; builds `GenerationRequest`, executes
+`generate_candidates`. Default mode is `fake` (no OpenAI). AI is never the
+default remediation path unless the adaptation plan requires synthesis.
+
+**Validation downstream of both branches** — `PrintValidationService` measures
+print-readiness (Option A) for whichever output type was produced, before any
+human approval.
 
 ---
 
@@ -120,19 +160,20 @@ Generation runs in **fake** mode by default (`PRINT_GENERATION_MODE=fake`) for
 tests and offline work. **OpenAI** mode delegates to `openai_image_client` and may
 persist bytes via `generated_artifact_store` under `artifacts/generated/`.
 
-### Post-validation (not yet wired)
+### Post-validation (wired)
 
 ```
-  -> ApprovalWorkflowService.create_approval_package     -> ApprovalPackage
+  -> ApprovalWorkflowService.create_approval_package      -> ApprovalPackage
   -> [STOP: owner_review_pending — human decides]
-  -> ApprovalWorkflowService.record_approval_decision  -> ApprovalDecision
-  -> ProductionPackagingService.create_production_package -> ProductionPackage
-  -> completed
+  -> ApprovalDecisionService.record_approval_decision     -> ApprovalDecision
+  -> ProductionPackagingService.create_production_package  -> ProductionPackage
+  -> [completion routing — no subsystem]                    -> COMPLETED
 ```
 
 The spine performs the corresponding legal transition before/after each call.
-Macro steps (generation, validation) record intermediate `*_PENDING` /
-`*_RUNNING` transitions in `transition_checks`.
+Macro steps (generation, validation, production packaging) record intermediate
+`*_PENDING` / `*_RUNNING` transitions in `transition_checks`. Completion from
+`PRODUCTION_PACKAGE_CREATED` records a single transition with no subsystem call.
 
 ### Output contracts: GeneratedCandidate vs TransformedAsset
 
@@ -149,22 +190,25 @@ model, latency, errors). It does not authorize workflow transitions.
 `PrintValidationService.validate_print_asset` measures **print-readiness only**
 (Option A): pixel dimensions, DPI, file format, and color profile when both
 sides provide one. It does not approve, score creative quality, or replace human
-review. Orchestration wiring from `GENERATION_COMPLETE` and
-`DETERMINISTIC_TRANSFORM_COMPLETE` is defined by tests and pending spine
-integration.
+review. Wired from both `GENERATION_COMPLETE` and
+`DETERMINISTIC_TRANSFORM_COMPLETE`.
 
 ### Current spine wiring status
 
-| Phase | Entry state | Service | Status |
+| Phase | Entry state | Subsystem | Status |
 | --- | --- | --- | --- |
-| 1 | `NORMALIZATION_PENDING` | Normalization | Wired |
-| 2 | `NORMALIZED` | Specification | Wired |
-| 3 | `SPECIFICATION_RESOLVED` | Compliance | Wired |
-| 4 | `COMPLIANCE_COMPLETE` | Adaptation | Wired |
-| 5 | `ADAPTATION_PLANNED` | Prompt construction | Wired (AI branch) |
-| 6 | `GENERATION_PENDING` | AI generation | Wired |
-| 7 | `DETERMINISTIC_TRANSFORM_PENDING` | Deterministic transform | Wired |
-| 8 | `GENERATION_COMPLETE` / `DETERMINISTIC_TRANSFORM_COMPLETE` | Validation | Service implemented; spine wiring pending |
+| 1 | `NORMALIZATION_PENDING` | `NormalizationService` | Wired |
+| 2 | `NORMALIZED` | `SpecificationResolutionService` | Wired |
+| 3 | `SPECIFICATION_RESOLVED` | `TechnicalComplianceService` | Wired |
+| 4 | `COMPLIANCE_COMPLETE` | `AdaptationPlanningService` | Wired |
+| 5 | `ADAPTATION_PLANNED` | `PromptConstructionService` | Wired (AI branch) |
+| 6 | `GENERATION_PENDING` | `AIGenerationService` | Wired |
+| 7 | `DETERMINISTIC_TRANSFORM_PENDING` | `DeterministicTransformService` | Wired |
+| 8 | `GENERATION_COMPLETE` / `DETERMINISTIC_TRANSFORM_COMPLETE` | `PrintValidationService` | Wired |
+| 9 | `VALIDATION_COMPLETE` | `ApprovalWorkflowService` | Wired |
+| 9b | `OWNER_REVIEW_PENDING` + approval metadata | `ApprovalDecisionService` | Wired |
+| 10 | `APPROVED` | `ProductionPackagingService` | Wired |
+| 11 | `PRODUCTION_PACKAGE_CREATED` | completion routing (no subsystem) | Wired |
 
 ## 6. Stop boundaries
 
@@ -211,3 +255,42 @@ stops via `is_terminal_state(...)`. At a stop, the spine returns the current
 - Orchestrator **never performs subsystem work directly** (e.g. with stub subsystems, all domain outputs originate from subsystem calls, never from the spine).
 - Orchestrator **honors the retry boundary** (retries only retryable states; stops after the configured attempt budget; never loops infinitely).
 - Orchestrator **is idempotent** (same `idempotency_key` returns the same run without re-executing side effects).
+
+---
+
+## 10. OpenAI integration boundary
+
+| Component | Role |
+| --- | --- |
+| `app/services/print_generation.py` | Generation actuator; selects `fake` vs `openai` mode |
+| `app/services/openai_image_client.py` | Provider boundary only — lazy OpenAI import, API key check, `images.generate` |
+| `app/services/generated_artifact_store.py` | Optional persistence under `artifacts/generated/` for OpenAI base64 payloads |
+| `scripts/demo_generate_image.py` | Manual smoke test outside the orchestrator |
+
+**Environment variables:** `PRINT_GENERATION_MODE` (default `fake`), `OPENAI_API_KEY`,
+`PRINT_OPENAI_IMAGE_MODEL`. See `docs/DEPLOYMENT.md`.
+
+The orchestrator never calls OpenAI directly; it invokes `generate_candidates`
+through the module import used for monkeypatching in tests.
+
+---
+
+## 11. Known MVP Tradeoffs
+
+- `ValidationResult.validated_candidate_ids` / `passed_candidate_ids` hold output
+  ids for both `GeneratedCandidate` and `TransformedAsset`.
+- Deterministic-transform validation uses a placeholder candidate on the run
+  bundle when `deterministic_transform` is not yet attached to
+  `PrintWorkflowRunResult`.
+- Approval decisions arrive via `request.metadata["approval_decision"]` rather
+  than typed request fields.
+- No external email delivery for owner review yet.
+
+---
+
+## 12. Workflow Completion Status
+
+- **All workflow stages implemented.**
+- **All workflow stages orchestrated** (Phases 1–11 in `print_orchestrator.py`).
+- **End-to-end happy path tested** (`test_end_to_end_happy_path_smoke`).
+- **233 tests passing.**
